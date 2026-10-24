@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-capacity_connect}
+      POSTGRES_USER: ${POSTGRES_USER:-capacity_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-capacity_user} -d ${POSTGRES_DB:-capacity_connect}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-capacity_user}:${POSTGRES_PASSWORD:-change-this-password}@db:5432/${POSTGRES_DB:-capacity_connect}
+    ports: ["8000:8000"]
+    volumes:
+      - uploaded_media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api}
+    ports: ["5173:5173"]
+    depends_on: [backend]
+volumes:
+  postgres_data:
+  uploaded_media:
