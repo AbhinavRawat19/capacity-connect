@@ -15,7 +15,9 @@ class RegisterSerializer(serializers.ModelSerializer):
         if value == 'admin': raise serializers.ValidationError('Admin accounts can only be created by an administrator.')
         return value
     def create(self, validated_data):
-        user = User.objects.create_user(**validated_data, is_approved=True)
+        # Learners are approved automatically; trainer accounts must be approved by an admin.
+        requested_role = validated_data.get('role', 'trainee')
+        user = User.objects.create_user(**validated_data, is_approved=(requested_role == 'trainee'))
         return user
 class CourseSerializer(serializers.ModelSerializer):
     trainer_name = serializers.SerializerMethodField()
@@ -73,6 +75,15 @@ class QuestionSubmissionSerializer(serializers.ModelSerializer):
         return obj.submitted_by.get_full_name() or obj.submitted_by.username
     def get_reviewed_by_name(self,obj):
         return (obj.reviewed_by.get_full_name() or obj.reviewed_by.username) if obj.reviewed_by else None
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        privileged = bool(user and user.is_authenticated and (user.is_superuser or user.role in ('trainer', 'admin')))
+        own_unpublished = bool(user and user.is_authenticated and instance.submitted_by_id == user.id and instance.status != 'approved')
+        if not (privileged or own_unpublished):
+            data.pop('correct_answer', None)
+        return data
     def validate_options(self, value):
         if not isinstance(value,list) or len(value) != 4 or any(not str(x).strip() for x in value):
             raise serializers.ValidationError('Provide exactly four non-empty answer options.')

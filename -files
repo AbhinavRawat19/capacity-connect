@@ -1,0 +1,47 @@
+[33mcommit 751c270381943400f6209a32ec86cee3bf2db972[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: Abhishek <abhishek.ak1203@gmail.com>
+Date:   Sat Oct 24 19:20:52 2026 +0530
+
+     CAPACITY CONNECT project
+
+ .env.example                                       |    8 [32m+[m
+ .gitignore                                         |   39 [32m+[m
+ LICENSE                                            |   21 [32m+[m
+ README.md                                          |   98 [32m+[m
+ backend/Dockerfile                                 |    7 [32m+[m
+ backend/config/__init__.py                         |    0
+ backend/config/settings.py                         |   45 [32m+[m
+ backend/config/urls.py                             |    5 [32m+[m
+ backend/config/wsgi.py                             |    4 [32m+[m
+ backend/core/__init__.py                           |    0
+ backend/core/admin.py                              |   18 [32m+[m
+ backend/core/apps.py                               |    4 [32m+[m
+ backend/core/management/__init__.py                |    0
+ backend/core/management/commands/__init__.py       |    0
+ backend/core/management/commands/seed_demo_data.py |   86 [32m+[m
+ backend/core/migrations/0001_initial.py            |  118 [32m++[m
+ backend/core/migrations/0002_open_learning.py      |   79 [32m+[m
+ .../migrations/0003_questionbank_course_lesson.py  |    9 [32m+[m
+ .../core/migrations/0004_alter_user_managers.py    |   20 [32m+[m
+ backend/core/migrations/__init__.py                |    0
+ backend/core/models.py                             |  155 [32m++[m
+ backend/core/permissions.py                        |    9 [32m+[m
+ backend/core/serializers.py                        |  151 [32m++[m
+ backend/core/urls.py                               |    6 [32m+[m
+ backend/core/views.py                              |  445 [32m+++++[m
+ backend/manage.py                                  |    6 [32m+[m
+ backend/package-lock.json                          |    6 [32m+[m
+ backend/requirements.txt                           |    6 [32m+[m
+ docker-compose.yml                                 |   35 [32m+[m
+ frontend/Dockerfile                                |    7 [32m+[m
+ frontend/index.html                                |    2 [32m+[m
+ frontend/package-lock.json                         | 1923 [32m++++++++++++++++++++[m
+ frontend/package.json                              |    9 [32m+[m
+ frontend/postcss.config.js                         |    1 [32m+[m
+ frontend/src/App.jsx                               |   85 [32m+[m
+ frontend/src/api.js                                |   13 [32m+[m
+ frontend/src/index.css                             |    4 [32m+[m
+ frontend/src/main.jsx                              |    5 [32m+[m
+ frontend/tailwind.config.js                        |    2 [32m+[m
+ frontend/vite.config.js                            |    3 [32m+[m
+ 40 files changed, 3434 insertions(+)

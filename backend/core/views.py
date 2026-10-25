@@ -14,7 +14,8 @@ class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all(); serializer_class = RegisterSerializer; permission_classes = [AllowAny]
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data); serializer.is_valid(raise_exception=True); user=serializer.save()
-        return Response({'message':'Welcome to CAPACITY CONNECT. Your account is ready; you can sign in now.','username':user.username}, status=status.HTTP_201_CREATED)
+        message = ('Your learner account is ready; you can sign in now.' if user.role == 'trainee' else 'Your trainer request has been submitted. An administrator must approve your account before you can teach.')
+        return Response({'message':f'Welcome to CAPACITY CONNECT. {message}','username':user.username,'role':user.role,'is_approved':user.is_approved}, status=status.HTTP_201_CREATED)
 
 @api_view(['GET','PATCH'])
 @permission_classes([IsAuthenticated, IsApproved])
@@ -32,9 +33,9 @@ def become_trainer(request):
     if request.user.is_superuser or request.user.role == 'admin':
         return Response({'detail':'Administrator accounts cannot switch to trainer mode.'},status=400)
     request.user.role='trainer'
-    request.user.is_approved=True
+    request.user.is_approved=False
     request.user.save(update_fields=['role','is_approved'])
-    return Response({'message':'Your account is now a trainer account. You can publish free courses.','user':UserSerializer(request.user).data})
+    return Response({'message':'Your trainer request has been submitted. An administrator must approve your account before you can teach.','user':UserSerializer(request.user).data}, status=202)
 
 class CourseViewSet(viewsets.ModelViewSet):
     serializer_class = CourseSerializer
@@ -167,16 +168,53 @@ class AttemptView(generics.ListAPIView):
 class QuestionSubmissionViewSet(viewsets.ModelViewSet):
     serializer_class = QuestionSubmissionSerializer
     permission_classes = [IsAuthenticated, IsApproved]
-    http_method_names = ['get','post','head','options']
+    http_method_names = ['get','post','put','patch','delete','head','options']
 
     def get_queryset(self):
         user=self.request.user
         qs=QuestionSubmission.objects.select_related('submitted_by','reviewed_by')
-        if user.role in ['trainer','admin'] or user.is_superuser:
+        if user.is_superuser or user.role == 'admin':
+            status_filter=self.request.query_params.get('status')
+            return qs.filter(status=status_filter) if status_filter in ['pending','approved','rejected','revision'] else qs
+        if user.role == 'trainer':
+            qs = qs.filter(course__trainer=user)
             status_filter=self.request.query_params.get('status')
             return qs.filter(status=status_filter) if status_filter in ['pending','approved','rejected','revision'] else qs
         # Students can view the published question bank and their own submissions only.
         return qs.filter(models_q_for_student(user))
+
+    def update(self, request, *args, **kwargs):
+        submission = self.get_object()
+        if request.user.role not in ['trainer', 'admin'] and not request.user.is_superuser:
+            if submission.submitted_by_id != request.user.id or submission.status not in ['pending', 'revision']:
+                return Response({'detail':'You can edit only your own questions while they are pending or need revision.'}, status=403)
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        submission = self.get_object()
+        if request.user.role not in ['trainer', 'admin'] and not request.user.is_superuser:
+            if submission.submitted_by_id != request.user.id or submission.status not in ['pending', 'revision']:
+                return Response({'detail':'You can delete only your own questions while they are pending or need revision.'}, status=403)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=False, methods=['post'], url_path='grade-practice')
+    def grade_practice(self, request):
+        answers = request.data.get('answers')
+        if not isinstance(answers, dict) or not answers:
+            return Response({'detail':'answers must be a non-empty object of question IDs to option indexes.'}, status=400)
+        ids = [int(k) for k in answers if str(k).isdigit()]
+        qs = QuestionSubmission.objects.filter(id__in=ids, status='approved')
+        by_id = {str(q.id): q for q in qs}
+        if len(by_id) != len(answers):
+            return Response({'detail':'One or more questions are unavailable.'}, status=400)
+        results = []
+        correct = 0
+        for qid, submitted in answers.items():
+            q = by_id[str(qid)]
+            is_correct = str(submitted) == str(q.correct_answer)
+            correct += int(is_correct)
+            results.append({'id': q.id, 'correct': is_correct, 'correct_answer': q.correct_answer, 'options': q.options, 'explanation': q.explanation})
+        return Response({'correct': correct, 'total': len(results), 'results': results})
 
     def create(self, request, *args, **kwargs):
         if request.user.role != 'trainee':
@@ -201,6 +239,8 @@ class QuestionSubmissionViewSet(viewsets.ModelViewSet):
         if request.user.role not in ['trainer','admin'] and not request.user.is_superuser:
             return Response({'detail':'Only trainers and administrators can review questions.'},status=403)
         submission=self.get_object()
+        if request.user.role == 'trainer' and not request.user.is_superuser and submission.course_id and submission.course.trainer_id != request.user.id:
+            return Response({'detail':'You can review questions only for your own courses.'}, status=403)
         decision=request.data.get('status')
         if decision not in ['approved','rejected','revision']:
             return Response({'detail':'status must be approved, rejected, or revision.'},status=400)
