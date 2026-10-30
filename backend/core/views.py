@@ -483,3 +483,27 @@ class CourseDiscussionViewSet(viewsets.ModelViewSet):
         if obj.author_id != request.user.id and not is_admin and not is_course_trainer:
             return Response({'detail':'You can delete your own posts, or moderate posts in your own course.'},status=403)
         obj.delete(); return Response(status=204)
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsApproved])
+def learning_intelligence(request):
+    from rest_framework.exceptions import ValidationError
+    from .ai_service import get_learning_recommendations
+
+    try:
+        max_recommendations = int(request.query_params.get('limit', 5))
+    except (TypeError, ValueError):
+        raise ValidationError({
+            'limit': 'Must be an integer between 1 and 20.'
+        })
+
+    if not 1 <= max_recommendations <= 20:
+        raise ValidationError({
+            'limit': 'Must be between 1 and 20.'
+        })
+
+    result = get_learning_recommendations(
+        request.user,
+        max_recommendations=max_recommendations
+    )
+
+    return Response(result.model_dump())
