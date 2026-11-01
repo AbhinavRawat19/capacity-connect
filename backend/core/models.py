@@ -85,6 +85,21 @@ class QuestionSubmission(models.Model):
         ordering = ['-submitted_at']
     def __str__(self): return f'{self.topic}: {self.question_text[:70]}'
 
+class QuestionPracticeRecord(models.Model):
+    """Latest practice result and one-time points for a learner/question pair."""
+    trainee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='question_practice_records')
+    question = models.ForeignKey(QuestionSubmission, on_delete=models.CASCADE, related_name='practice_records')
+    submitted_answer = models.PositiveSmallIntegerField()
+    is_correct = models.BooleanField(default=False)
+    points_earned = models.PositiveIntegerField(default=0)
+    first_correct_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['trainee', 'question'], name='unique_learner_question_practice')]
+        ordering = ['-updated_at']
+
+
 class CourseLesson(models.Model):
     """A lecture or resource inside a free course."""
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='lessons')

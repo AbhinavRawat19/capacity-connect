@@ -57,8 +57,30 @@ class Command(BaseCommand):
                 {'id':'sql3','text':'Which clause sorts query results?','options':['SORT','ORDER BY','ARRANGE','RANK'], 'correct_answer':1,'explanation':'ORDER BY sorts results by one or more columns.'},
             ]),
         ]
+        # Keep demo assessments deterministic and mirror every assessment question into the approved Question Bank.
+        lesson_by_course = {course.id: list(CourseLesson.objects.filter(course=course).order_by('position')) for course in courses}
         for idx,title,instructions,questions in quiz_specs:
-            Assessment.objects.get_or_create(course=courses[idx],title=title,defaults={'instructions':instructions,'duration_minutes':10,'questions':questions,'created_by':trainer,'is_published':True})
+            linked_questions = []
+            for q in questions:
+                bank_item = QuestionSubmission.objects.filter(question_text__iexact=q['text'], course=courses[idx]).first()
+                if bank_item is None:
+                    bank_item = QuestionSubmission.objects.create(
+                        submitted_by=trainer, course=courses[idx],
+                        lesson=lesson_by_course[courses[idx].id][0] if lesson_by_course[courses[idx].id] else None,
+                        question_text=q['text'], options=q['options'], correct_answer=q['correct_answer'],
+                        explanation=q.get('explanation',''), topic=courses[idx].category, difficulty='beginner',
+                        status='approved', reviewed_by=trainer, reviewed_at=timezone.now(), published_at=timezone.now())
+                else:
+                    bank_item.options=q['options']; bank_item.correct_answer=q['correct_answer']; bank_item.explanation=q.get('explanation','')
+                    bank_item.status='approved'; bank_item.reviewed_by=trainer; bank_item.reviewed_at=bank_item.reviewed_at or timezone.now(); bank_item.published_at=bank_item.published_at or timezone.now()
+                    if not bank_item.lesson and lesson_by_course[courses[idx].id]: bank_item.lesson=lesson_by_course[courses[idx].id][0]
+                    bank_item.save()
+                linked = dict(q)
+                linked['question_bank_id'] = bank_item.id
+                linked_questions.append(linked)
+            assessment, _ = Assessment.objects.get_or_create(course=courses[idx], title=title, defaults={'instructions':instructions,'duration_minutes':10,'created_by':trainer,'is_published':True})
+            assessment.instructions=instructions; assessment.duration_minutes=10; assessment.questions=linked_questions; assessment.created_by=trainer; assessment.is_published=True
+            assessment.save()
 
         assignment_specs = [
             (0,'Build a CLI Calculator','Write a Python command-line calculator supporting addition, subtraction, multiplication, and division. Validate input and handle division by zero.',100),
@@ -81,6 +103,6 @@ class Command(BaseCommand):
             if not created and (item.course_id != course.id or item.lesson_id != (lesson.id if lesson else None)):
                 item.course=course; item.lesson=lesson; item.save(update_fields=['course','lesson'])
 
-        self.stdout.write(self.style.SUCCESS('Demo data is ready: 3 courses, lessons, 3 quizzes, 3 assignments, and 3 approved questions.'))
+        self.stdout.write(self.style.SUCCESS('Demo data is ready: assessment questions are synchronized to the approved Question Bank; courses, lessons, quizzes, and assignments are up to date.'))
         self.stdout.write('Sample trainer username: demo_trainer')
         self.stdout.write('Sample trainer password (only if newly created): DemoTrainer123!')

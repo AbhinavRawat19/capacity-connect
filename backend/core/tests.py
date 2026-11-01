@@ -1,8 +1,13 @@
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
+import tempfile
 
-from .models import Course, QuestionSubmission, Assessment, Attempt
+from .models import Course, Enrollment, CourseLesson, QuestionSubmission, Assessment, Attempt, QuestionPracticeRecord
+from .ai_service import get_learning_recommendations
+from .views import sync_assessment_questions_to_bank
 
 User = get_user_model()
 
@@ -67,6 +72,40 @@ class CapacityConnectFixRegressionTests(TestCase):
         self.assertEqual(graded.data["correct"], 1)
         self.assertEqual(graded.data["results"][0]["correct_answer"], 1)
 
+    def test_question_bank_practice_updates_leaderboard_and_prevents_duplicate_points(self):
+        self.client.force_authenticate(user=self.learner)
+        first = self.client.post("/api/question-submissions/grade-practice/", {
+            "answers": {str(self.question.id): 1}
+        }, format="json")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.data["points_earned"], 10)
+        second = self.client.post("/api/question-submissions/grade-practice/", {
+            "answers": {str(self.question.id): 1}
+        }, format="json")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data["points_earned"], 0)
+        self.assertEqual(QuestionPracticeRecord.objects.filter(trainee=self.learner, question=self.question).count(), 1)
+        board = self.client.get("/api/leaderboard/")
+        self.assertEqual(board.status_code, 200)
+        learner_row = next(row for row in board.data["global"] if row["user_id"] == self.learner.id)
+        self.assertEqual(learner_row["points"], 10)
+        self.assertTrue(any(row["question_key"] == f"qb:{self.question.id}" for row in board.data["per_question"]))
+
+    def test_trainer_can_publish_question_to_owned_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/question-submissions/", {
+            "course": self.course.id,
+            "question_text": "Trainer authored practice question?",
+            "options": ["A", "B", "C", "D"],
+            "correct_answer": 2,
+            "topic": "Regression",
+            "difficulty": "beginner",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        created = QuestionSubmission.objects.get(question_text="Trainer authored practice question?")
+        self.assertEqual(created.status, "approved")
+        self.assertEqual(created.course_id, self.course.id)
+
     def test_learner_can_edit_and_delete_own_pending_question(self):
         self.client.force_authenticate(user=self.learner)
         response = self.client.post("/api/question-submissions/", {
@@ -111,6 +150,35 @@ class CapacityConnectFixRegressionTests(TestCase):
         self.assertIn(own_question.id, ids)
         self.assertNotIn(other_question.id, ids)
 
+    def test_assessment_questions_are_synced_to_question_bank(self):
+        assessment = Assessment.objects.create(
+            course=self.course, title="Sync Test", created_by=self.trainer,
+            questions=[{"id": "legacy-q1", "text": "A question only in an assessment?",
+                        "options": ["No", "Yes", "Maybe", "Later"], "correct_answer": 1}],
+        )
+        sync_assessment_questions_to_bank(assessment)
+        assessment.refresh_from_db()
+        linked_id = assessment.questions[0].get("question_bank_id")
+        self.assertIsNotNone(linked_id)
+        bank_question = QuestionSubmission.objects.get(pk=linked_id)
+        self.assertEqual(bank_question.status, "approved")
+        self.assertEqual(bank_question.question_text, "A question only in an assessment?")
+        self.assertEqual(bank_question.correct_answer, 1)
+
+    def test_assessment_question_not_in_bank_is_not_shown_in_per_question_leaderboard(self):
+        assessment = Assessment.objects.create(
+            course=self.course, title="Legacy Unsynced Quiz", created_by=self.trainer,
+            questions=[{"id": "legacy-q2", "text": "Unlinked question?", "options": ["A", "B"], "correct_answer": 0}],
+        )
+        Attempt.objects.create(
+            trainee=self.learner, assessment=assessment, score=100, total_questions=1,
+            question_results={"legacy-q2": True}, question_timings={"legacy-q2": 1000}, points=15,
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/leaderboard/")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(any(row["assessment_id"] == assessment.id for row in response.data["per_question"]))
+
     def test_leaderboard_excludes_trainer_accounts(self):
         assessment = Assessment.objects.create(
             course=self.course, title="Test quiz", created_by=self.trainer,
@@ -124,3 +192,87 @@ class CapacityConnectFixRegressionTests(TestCase):
         response = self.client.get("/api/leaderboard/")
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(self.trainer.id, [row["user_id"] for row in response.data["global"]])
+
+    def test_admin_can_add_lecture_to_another_trainers_course(self):
+        admin = User.objects.create_user(
+            username="site_admin", password="StrongPass123!", role="admin", is_approved=True
+        )
+        self.client.force_authenticate(user=admin)
+        response = self.client.post("/api/lessons/", {
+            "course": self.course.id,
+            "title": "Admin-added lecture",
+            "description": "Published by administrator",
+            "position": 1,
+            "video_url": "https://example.com/lecture",
+            "duration_minutes": 12,
+            "is_preview": True,
+        }, format="multipart")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(CourseLesson.objects.filter(course=self.course, title="Admin-added lecture").exists())
+
+    def test_trainer_cannot_add_lecture_to_another_trainers_course(self):
+        other_trainer = User.objects.create_user(
+            username="other_trainer_upload", password="StrongPass123!", role="trainer", is_approved=True
+        )
+        Course.objects.create(title="Other Trainer Course", description="Other course", trainer=other_trainer)
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/lessons/", {
+            "course": Course.objects.get(title="Other Trainer Course").id,
+            "title": "Should be denied",
+            "video_url": "https://example.com/lecture",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_can_upload_video_file(self):
+        admin = User.objects.create_user(
+            username="video_admin", password="StrongPass123!", role="admin", is_approved=True
+        )
+        self.client.force_authenticate(user=admin)
+        with tempfile.TemporaryDirectory() as media_dir, override_settings(MEDIA_ROOT=media_dir):
+            video = SimpleUploadedFile("sample.mp4", b"fake-video-content", content_type="video/mp4")
+            response = self.client.post("/api/lessons/", {
+                "course": self.course.id,
+                "title": "Uploaded video",
+                "video_file": video,
+            }, format="multipart")
+            self.assertEqual(response.status_code, 201, response.data)
+            lesson = CourseLesson.objects.get(title="Uploaded video")
+            self.assertTrue(lesson.video_file.name)
+            self.assertIn("video_file_url", response.data)
+
+    def test_trainer_can_upload_video_file_to_owned_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        with tempfile.TemporaryDirectory() as media_dir, override_settings(MEDIA_ROOT=media_dir):
+            video = SimpleUploadedFile("trainer-sample.mp4", b"fake-video-content", content_type="video/mp4")
+            response = self.client.post("/api/lessons/", {
+                "course": self.course.id,
+                "title": "Trainer uploaded video",
+                "video_file": video,
+            }, format="multipart")
+            self.assertEqual(response.status_code, 201, response.data)
+            self.assertTrue(CourseLesson.objects.filter(title="Trainer uploaded video", course=self.course).exists())
+
+    def test_learning_recommendations_use_popularity_when_no_interests(self):
+        popular = Course.objects.create(title="Popular Course", description="Popular", trainer=self.trainer)
+        less_popular = Course.objects.create(title="Less Popular Course", description="Less popular", trainer=self.trainer)
+        another_learner = User.objects.create_user(
+            username="enrolled_learner", password="StrongPass123!", role="trainee", is_approved=True
+        )
+        Enrollment.objects.create(trainee=self.learner, course=popular)
+        Enrollment.objects.create(trainee=another_learner, course=popular)
+        Enrollment.objects.create(trainee=self.learner, course=less_popular)
+        self.learner.competencies = []
+        self.learner.save(update_fields=["competencies"])
+        result = get_learning_recommendations(self.learner, max_recommendations=5)
+        self.assertGreaterEqual(len(result.recommendations), 2)
+        self.assertEqual(result.recommendations[0].course_id, str(popular.id))
+        self.assertTrue(any("popularity" in note.lower() for note in result.notes))
+
+    def test_newly_published_course_is_in_recommendation_catalog(self):
+        self.learner.competencies = []
+        self.learner.save(update_fields=["competencies"])
+        fresh_course = Course.objects.create(
+            title="Fresh Published Course", description="New course", trainer=self.trainer, is_published=True
+        )
+        result = get_learning_recommendations(self.learner, max_recommendations=20)
+        self.assertIn(str(fresh_course.id), [rec.course_id for rec in result.recommendations])

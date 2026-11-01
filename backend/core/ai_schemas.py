@@ -21,6 +21,7 @@ class CourseInput(BaseModel):
     category: Optional[str] = None
     difficulty: Optional[str] = "Beginner"
     rating: float = Field(default=4.0, ge=0, le=5)
+    popularity_count: int = Field(default=0, ge=0)
     duration: Optional[str] = None
     estimated_hours: Optional[float] = Field(default=None, gt=0, le=1000)
     description: Optional[str] = None

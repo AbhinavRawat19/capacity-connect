@@ -6,7 +6,7 @@ from rest_framework import generics, status, viewsets
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission
+from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission, QuestionPracticeRecord
 from .serializers import UserSerializer, RegisterSerializer, CourseSerializer, EnrollmentSerializer, AssessmentSerializer, AttemptSerializer, QuestionSubmissionSerializer
 from .permissions import IsApproved, IsAdminRole, IsTrainerOrAdmin
 
@@ -72,6 +72,70 @@ class MyEnrollmentsView(generics.ListAPIView):
     serializer_class=EnrollmentSerializer; permission_classes=[IsAuthenticated,IsApproved]
     def get_queryset(self): return Enrollment.objects.filter(trainee=self.request.user).select_related('course','course__trainer')
 
+def sync_assessment_questions_to_bank(assessment):
+    """Ensure every saved assessment question has a canonical Question Bank entry.
+
+    Assessment questions remain embedded JSON for backwards compatibility, but each
+    one receives question_bank_id pointing at the corresponding approved bank item.
+    """
+    questions = assessment.questions or []
+    if not isinstance(questions, list) or not questions:
+        return
+    author = assessment.created_by
+    if not author or author.role not in ['trainer', 'admin']:
+        author = assessment.course.trainer
+    if not author:
+        return
+    changed = False
+    for item in questions:
+        if not isinstance(item, dict) or not item.get('text'):
+            continue
+        linked_id = item.get('question_bank_id')
+        bank_item = None
+        if linked_id:
+            bank_item = QuestionSubmission.objects.filter(pk=linked_id, course=assessment.course).first()
+        normalized = ' '.join(str(item['text']).lower().split())
+        if bank_item is None:
+            candidates = QuestionSubmission.objects.filter(course=assessment.course).exclude(status='rejected')
+            for candidate in candidates:
+                if ' '.join(candidate.question_text.lower().split()) == normalized:
+                    bank_item = candidate
+                    break
+        options = item.get('options') or []
+        try:
+            correct_answer = int(item.get('correct_answer', 0))
+        except (TypeError, ValueError):
+            correct_answer = 0
+        if bank_item is None:
+            bank_item = QuestionSubmission.objects.create(
+                submitted_by=author, course=assessment.course,
+                question_text=str(item['text']), options=options,
+                correct_answer=max(0, min(correct_answer, max(len(options) - 1, 0))),
+                explanation=str(item.get('explanation', '')),
+                topic=assessment.course.category or 'General', difficulty='beginner',
+                status='approved', reviewed_by=author, reviewed_at=timezone.now(),
+                published_at=timezone.now(),
+            )
+        else:
+            # Keep the Question Bank's content aligned with the assessment's actual
+            # options and answer; assessment questions are already publishable content.
+            bank_item.question_text = str(item['text'])
+            bank_item.options = options
+            bank_item.correct_answer = max(0, min(correct_answer, max(len(options) - 1, 0)))
+            bank_item.explanation = str(item.get('explanation', bank_item.explanation or ''))
+            bank_item.status = 'approved'
+            bank_item.reviewed_by = author
+            bank_item.reviewed_at = bank_item.reviewed_at or timezone.now()
+            bank_item.published_at = bank_item.published_at or timezone.now()
+            bank_item.save()
+        if str(item.get('question_bank_id', '')) != str(bank_item.id):
+            item['question_bank_id'] = bank_item.id
+            changed = True
+    if changed:
+        assessment.questions = questions
+        assessment.save(update_fields=['questions'])
+
+
 class AssessmentViewSet(viewsets.ModelViewSet):
     serializer_class=AssessmentSerializer; permission_classes=[IsAuthenticated,IsApproved]
     def get_queryset(self):
@@ -88,7 +152,11 @@ class AssessmentViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         course=serializer.validated_data['course']; user=self.request.user
         if user.role=='trainer' and course.trainer_id != user.id: raise PermissionError('Trainers can only create assessments for their own courses.')
-        serializer.save(created_by=user)
+        assessment = serializer.save(created_by=user)
+        sync_assessment_questions_to_bank(assessment)
+    def perform_update(self, serializer):
+        assessment = serializer.save()
+        sync_assessment_questions_to_bank(assessment)
     def create(self, request, *args, **kwargs):
         try: return super().create(request,*args,**kwargs)
         except PermissionError as e: return Response({'detail':str(e)},status=403)
@@ -177,7 +245,10 @@ class QuestionSubmissionViewSet(viewsets.ModelViewSet):
             status_filter=self.request.query_params.get('status')
             return qs.filter(status=status_filter) if status_filter in ['pending','approved','rejected','revision'] else qs
         if user.role == 'trainer':
-            qs = qs.filter(course__trainer=user)
+            # Trainers manage every question on their own courses, but can also practise the published
+            # (approved) bank of other courses and always see questions they submitted themselves.
+            from django.db.models import Q
+            qs = qs.filter(Q(course__trainer=user) | Q(status='approved') | Q(submitted_by=user))
             status_filter=self.request.query_params.get('status')
             return qs.filter(status=status_filter) if status_filter in ['pending','approved','rejected','revision'] else qs
         # Students can view the published question bank and their own submissions only.
@@ -209,30 +280,61 @@ class QuestionSubmissionViewSet(viewsets.ModelViewSet):
             return Response({'detail':'One or more questions are unavailable.'}, status=400)
         results = []
         correct = 0
-        for qid, submitted in answers.items():
-            q = by_id[str(qid)]
-            is_correct = str(submitted) == str(q.correct_answer)
-            correct += int(is_correct)
-            results.append({'id': q.id, 'correct': is_correct, 'correct_answer': q.correct_answer, 'options': q.options, 'explanation': q.explanation})
-        return Response({'correct': correct, 'total': len(results), 'results': results})
+        awarded = 0
+        with transaction.atomic():
+            for qid, submitted in answers.items():
+                q = by_id[str(qid)]
+                try:
+                    submitted_index = int(submitted)
+                except (TypeError, ValueError):
+                    return Response({'detail': f'Invalid option index for question {qid}.'}, status=400)
+                if submitted_index < 0 or submitted_index >= len(q.options):
+                    return Response({'detail': f'Invalid option index for question {qid}.'}, status=400)
+                is_correct = submitted_index == q.correct_answer
+                correct += int(is_correct)
+                record, _ = QuestionPracticeRecord.objects.get_or_create(
+                    trainee=request.user, question=q,
+                    defaults={'submitted_answer': submitted_index, 'is_correct': is_correct},
+                )
+                points_earned = 0
+                # First correct answer earns 10 points. Repeated submissions cannot farm points.
+                if is_correct and record.points_earned == 0:
+                    record.points_earned = 10
+                    record.first_correct_at = timezone.now()
+                    points_earned = 10
+                record.submitted_answer = submitted_index
+                record.is_correct = record.is_correct or is_correct
+                record.save()
+                awarded += points_earned
+                results.append({'id': q.id, 'correct': is_correct, 'correct_answer': q.correct_answer, 'options': q.options, 'explanation': q.explanation, 'points_earned': points_earned})
+        return Response({'correct': correct, 'total': len(results), 'points_earned': awarded, 'results': results})
 
     def create(self, request, *args, **kwargs):
-        if request.user.role != 'trainee':
-            return Response({'detail':'Only trainees can submit community questions.'},status=403)
+        user = request.user
+        if user.role not in ['trainee', 'trainer', 'admin'] and not user.is_superuser:
+            return Response({'detail':'Your account cannot submit questions.'}, status=403)
         serializer=self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        course = serializer.validated_data.get('course')
+        lesson = serializer.validated_data.get('lesson')
+        if lesson and course and lesson.course_id != course.id:
+            return Response({'detail':'Selected lecture must belong to the selected course.'}, status=400)
+        if lesson and not course:
+            course = lesson.course
+        if user.role == 'trainer' and (not course or course.trainer_id != user.id):
+            return Response({'detail':'Choose one of your own courses to add a question.'}, status=403)
         normalized=' '.join(serializer.validated_data['question_text'].lower().split())
         for existing in QuestionSubmission.objects.filter(status__in=['pending','approved']).only('question_text'):
             if ' '.join(existing.question_text.lower().split()) == normalized:
                 return Response({'detail':'A matching question is already pending review or published.'},status=400)
-        course_id=serializer.validated_data.get('course').id if serializer.validated_data.get('course') else None
-        lesson=serializer.validated_data.get('lesson')
-        if lesson and course_id and lesson.course_id != course_id:
-            return Response({'detail':'Selected lecture must belong to the selected course.'},status=400)
-        if lesson and not course_id:
-            serializer.validated_data['course']=lesson.course
-        serializer.save(submitted_by=request.user)
-        return Response({'message':'Question submitted for trainer review.','submission':serializer.data},status=201)
+        if user.role in ['trainer', 'admin'] or user.is_superuser:
+            submission=serializer.save(submitted_by=user, course=course, status='approved', reviewed_by=user,
+                reviewed_at=timezone.now(), published_at=timezone.now())
+            message='Question added to the approved Question Bank.'
+        else:
+            submission=serializer.save(submitted_by=user, course=course, status='pending')
+            message='Question submitted for trainer review.'
+        return Response({'message':message,'submission':self.get_serializer(submission).data},status=201)
 
     @action(detail=True, methods=['post'])
     def review(self, request, pk=None):
@@ -270,6 +372,16 @@ def leaderboard(request):
         row['points']+=attempt.points
         row['correct_answers']+=sum(1 for correct in (attempt.question_results or {}).values() if correct)
         row['attempts']+=1
+    # Include Question Bank practice in the same global leaderboard.
+    practice_records = QuestionPracticeRecord.objects.select_related('trainee', 'question', 'question__course').filter(trainee__role='trainee')
+    practice_by_question = {}
+    for record in practice_records:
+        row = totals.setdefault(record.trainee_id, {'user_id': record.trainee_id, 'username': record.trainee.get_full_name() or record.trainee.username, 'points': 0, 'correct_answers': 0, 'attempts': 0})
+        row['points'] += record.points_earned
+        if record.is_correct:
+            row['correct_answers'] += 1
+        practice_by_question.setdefault(record.question_id, []).append(record)
+
     # Reward useful community contributions: each approved question adds five points.
     approved_counts={}
     for submission in QuestionSubmission.objects.filter(status='approved', submitted_by__role='trainee').select_related('submitted_by'):
@@ -289,11 +401,28 @@ def leaderboard(request):
         questions=attempt.assessment.questions or []
         for index,question in enumerate(questions):
             qid=str(question.get('id',index+1))
+            bank_id = question.get('question_bank_id')
+            if not bank_id or not QuestionSubmission.objects.filter(pk=bank_id, course=attempt.assessment.course, status='approved').exists():
+                # Never show an assessment question in per-question rankings unless it
+                # is represented by an approved Question Bank entry.
+                continue
             if not (attempt.question_results or {}).get(qid,False): continue
             elapsed=(attempt.question_timings or {}).get(qid,(attempt.question_timings or {}).get(str(index+1),600000))
             try: elapsed=int(elapsed)
             except (TypeError,ValueError): elapsed=600000
             per_question.append({'question_key':f"{attempt.assessment_id}:{qid}",'question_id':qid,'assessment_id':attempt.assessment_id,'assessment_title':attempt.assessment.title,'course_title':attempt.assessment.course.title,'question_text':question.get('text','Question'),'student':attempt.trainee.get_full_name() or attempt.trainee.username,'user_id':attempt.trainee_id,'elapsed_ms':elapsed,'points':10+max(0,5-min(5,elapsed//6000)),'submitted_at':attempt.submitted_at})
+    # Question Bank questions have their own stable IDs, separate from assessment IDs.
+    for question_id, records in practice_by_question.items():
+        question = records[0].question
+        key = f'qb:{question_id}'
+        for record in records:
+            if not record.is_correct:
+                continue
+            per_question.append({'question_key': key, 'question_id': str(question_id), 'assessment_id': None,
+                'assessment_title': 'Question Bank Practice', 'course_title': question.course.title if question.course else 'General',
+                'question_text': question.question_text, 'student': record.trainee.get_full_name() or record.trainee.username,
+                'user_id': record.trainee_id, 'elapsed_ms': 600000, 'points': record.points_earned,
+                'submitted_at': record.first_correct_at or record.updated_at})
     per_question.sort(key=lambda row:(row['question_key'],-row['points'],row['elapsed_ms'],row['submitted_at']))
     grouped={}
     for row in per_question:

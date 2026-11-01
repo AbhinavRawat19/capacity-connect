@@ -33,6 +33,11 @@ AUTH_PASSWORD_VALIDATORS = [
 LANGUAGE_CODE='en-us'; TIME_ZONE='Asia/Kolkata'; USE_I18N=True; USE_TZ=True
 STATIC_URL='static/'; DEFAULT_AUTO_FIELD='django.db.models.BigAutoField'
 CORS_ALLOWED_ORIGINS = [x.strip() for x in os.getenv('CORS_ALLOWED_ORIGINS','http://localhost:5173,http://127.0.0.1:5173').split(',') if x.strip()]
+# Vite moves to 5174, 5175... when 5173 is busy; in local dev accept any localhost/127.0.0.1 port so login never fails with 'Failed to fetch'.
+CORS_ALLOWED_ORIGIN_REGEXES = [r'^http://(localhost|127\.0\.0\.1):\d+$'] if DEBUG else []
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + ['cache-control', 'pragma']
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 REST_FRAMEWORK = {
  'DEFAULT_AUTHENTICATION_CLASSES': ('rest_framework_simplejwt.authentication.JWTAuthentication',),
  'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAuthenticated',),

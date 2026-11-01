@@ -99,13 +99,10 @@ def _gap_results(request: LearningIntelligenceRequest) -> list[SkillGapResult]:
 def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult]) -> list[CourseRecommendation]:
     skill_by_name = {s.name.casefold(): s for s in request.skills}
     completed = set(request.completed_course_ids)
-    candidates: list[CourseRecommendation] = []
+    eligible_courses = [c for c in request.courses if c.id not in completed]
 
-    for course in request.courses:
-        if course.id in completed:
-            continue
-
-        matches: list[tuple[float, SkillGapResult, str]] = []
+    def matches_for(course: CourseInput) -> list[tuple[float, SkillGapResult, str]]:
+        matches = []
         for gap in gaps:
             if gap.gap <= 0:
                 continue
@@ -113,11 +110,61 @@ def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult])
             match_score, match_reason = _course_match(skill, course)
             if match_reason and match_score >= 0.5:
                 matches.append((match_score, gap, match_reason))
+        return matches
+
+    # If the learner has no usable skills/gaps, or no course matches the gaps,
+    # recommend by actual enrollment popularity instead of returning an empty or
+    # alphabetically arbitrary list. New courses are eligible immediately; ties
+    # are resolved by title for deterministic output.
+    has_personalized_match = any(matches_for(course) for course in eligible_courses)
+    if not request.skills or not any(g.gap > 0 for g in gaps) or not has_personalized_match:
+        popular = sorted(
+            eligible_courses,
+            key=lambda c: (-c.popularity_count, c.title.casefold(), c.id),
+        )
+        results = []
+        for rank, course in enumerate(popular[:request.max_recommendations]):
+            score = round(60.0 - rank * (20.0 / max(1, min(len(popular), request.max_recommendations))), 2)
+            reason = (
+                f"Popular course: {course.popularity_count} learner enrollment(s)."
+                if course.popularity_count != 1
+                else "Popular course: 1 learner enrollment."
+            )
+            if course.popularity_count == 0:
+                reason = "Recommended from the available published catalog; popularity data is not available yet."
+            unmet = [p for p in course.prerequisites if p not in completed]
+            results.append(CourseRecommendation(
+                course_id=course.id,
+                title=course.title,
+                score=score,
+                priority="Low",
+                matched_skills=[],
+                reasons=[reason, "Popularity fallback is used because there is not enough skill-match data for reliable personalization."],
+                difficulty=course.difficulty,
+                duration=course.duration,
+                prerequisites=course.prerequisites,
+                unmet_prerequisites=unmet,
+            ))
+        return results
+
+    candidates: list[CourseRecommendation] = []
+    max_popularity = max((c.popularity_count for c in eligible_courses), default=0)
+    for course in eligible_courses:
+        matches = matches_for(course)
         if not matches:
+            # Keep untagged/new courses discoverable below personalized matches.
+            popularity_bonus = 5.0 * course.popularity_count / max(1, max_popularity)
+            candidates.append(CourseRecommendation(
+                course_id=course.id, title=course.title,
+                score=round(20.0 + popularity_bonus, 2), priority="Low", matched_skills=[],
+                reasons=["Available published course; competency tags do not yet match your profile.",
+                         f"Enrollment popularity: {course.popularity_count} learner(s)."],
+                difficulty=course.difficulty, duration=course.duration,
+                prerequisites=course.prerequisites,
+                unmet_prerequisites=[p for p in course.prerequisites if p not in completed],
+            ))
             continue
 
-        # One course may address several gaps. Score it against its strongest
-        # match, with a smaller contribution from the additional covered gaps.
         matches.sort(key=lambda x: (x[0], x[1].gap), reverse=True)
         best_match, best_gap, best_reason = matches[0]
         additional_coverage = min(0.10, 0.025 * (len(matches) - 1))
@@ -130,18 +177,14 @@ def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult])
             reasons.append("Also addresses: " + ", ".join(covered[1:]) + ".")
         if course.rating:
             reasons.append(f"Catalog rating: {course.rating:g}/5.")
+        if course.popularity_count:
+            reasons.append(f"Enrollment popularity: {course.popularity_count} learner(s).")
         unmet = [p for p in course.prerequisites if p not in completed]
         candidates.append(CourseRecommendation(
-            course_id=course.id,
-            title=course.title,
-            score=round(score * 100, 2),
-            priority=best_gap.priority,
-            matched_skills=[m[1].skill_name for m in matches],
-            reasons=reasons,
-            difficulty=course.difficulty,
-            duration=course.duration,
-            prerequisites=course.prerequisites,
-            unmet_prerequisites=unmet,
+            course_id=course.id, title=course.title, score=round(score * 100, 2),
+            priority=best_gap.priority, matched_skills=[m[1].skill_name for m in matches],
+            reasons=reasons, difficulty=course.difficulty, duration=course.duration,
+            prerequisites=course.prerequisites, unmet_prerequisites=unmet,
         ))
 
     priority_order = {"High": 0, "Medium": 1, "Low": 2, "Mastered": 3}
@@ -216,11 +259,13 @@ def build_learning_intelligence(request: LearningIntelligenceRequest) -> Learnin
         "Scores rank courses within the supplied catalog and are not probabilities of learner success.",
     ]
     if not request.skills:
-        notes.append("No skills were supplied, so no gaps or recommendations could be calculated.")
+        notes.append("No learner skills were supplied; recommendations use enrollment popularity as a fallback.")
     elif not request.courses:
         notes.append("No course catalog was supplied, so course recommendations and the learning path are empty.")
-    if not recommendations and request.skills and request.courses:
-        notes.append("No available course matched the learner's unmet skill gaps; add course skill tags or target mappings.")
+    if request.courses and (not request.skills or not any(g.gap > 0 for g in gaps)):
+        notes.append("Personalization data is insufficient, so published courses are ranked by enrollment popularity.")
+    elif request.courses and not any(rec.matched_skills for rec in recommendations):
+        notes.append("No course matched the learner's unmet skill gaps; recommendations use enrollment popularity as a fallback.")
 
     overall = round(sum(s.current_score for s in request.skills) / len(request.skills), 2) if request.skills else 0.0
     return LearningIntelligenceResponse(

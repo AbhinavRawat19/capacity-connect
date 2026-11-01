@@ -23,7 +23,7 @@ def get_learning_recommendations(user, max_recommendations=5):
             target_score = 100.0
 
         elif isinstance(item, dict):
-            name = str(item.get("name", "")).strip()
+            name = str(item.get("name") or item.get("skill_name") or item.get("title") or "").strip()
             if not name:
                 continue
 
@@ -52,20 +52,28 @@ def get_learning_recommendations(user, max_recommendations=5):
             )
         )
 
+    # Enrollment count is the platform's available popularity signal.
+    # Annotating it keeps recommendation ranking current without a separate ML catalog.
+    from django.db.models import Count
     db_courses = Course.objects.filter(
         is_published=True
-    ).order_by("id")
+    ).annotate(popularity_count=Count("enrollments")).order_by("id")
 
     courses = []
 
     for course in db_courses:
         competencies = course.competencies or []
 
-        target_skills = [
-            skill.strip()
-            for skill in competencies
-            if isinstance(skill, str) and skill.strip()
-        ]
+        target_skills = []
+        for skill in competencies:
+            if isinstance(skill, str):
+                name = skill.strip()
+            elif isinstance(skill, dict):
+                name = str(skill.get("name") or skill.get("skill_name") or skill.get("title") or "").strip()
+            else:
+                name = ""
+            if name and name != "[object Object]":
+                target_skills.append(name)
 
         estimated_hours = (
             float(course.duration_hours)
@@ -80,6 +88,7 @@ def get_learning_recommendations(user, max_recommendations=5):
                 category=course.category,
                 difficulty=course.level,
                 rating=4.0,
+                popularity_count=course.popularity_count,
                 estimated_hours=estimated_hours,
                 description=course.description,
                 target_skills=target_skills,
