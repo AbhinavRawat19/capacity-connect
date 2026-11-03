@@ -276,3 +276,991 @@ class CapacityConnectFixRegressionTests(TestCase):
         )
         result = get_learning_recommendations(self.learner, max_recommendations=20)
         self.assertIn(str(fresh_course.id), [rec.course_id for rec in result.recommendations])
+
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive API test suite covering all untested endpoints and scenarios.
+# ---------------------------------------------------------------------------
+from decimal import Decimal
+from django.utils import timezone
+from datetime import timedelta
+from .models import (
+    Course, Enrollment, CourseLesson, QuestionSubmission, Assessment, Attempt,
+    QuestionPracticeRecord, Assignment, AssignmentSubmission, CourseDiscussion, Payment,
+)
+
+
+class CapacityConnectFullAPITests(TestCase):
+    """Exhaustive test coverage for every API endpoint not already covered by
+    CapacityConnectFixRegressionTests."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+        # Admin (non-superuser admin role)
+        self.admin = User.objects.create_user(
+            username="api_admin", password="StrongPass123!",
+            role="admin", is_approved=True,
+        )
+        # Superuser
+        self.superuser = User.objects.create_superuser(
+            username="su_admin", password="StrongPass123!", email="su@example.com",
+        )
+        # Approved trainer
+        self.trainer = User.objects.create_user(
+            username="api_trainer", password="StrongPass123!",
+            role="trainer", is_approved=True,
+        )
+        # Second approved trainer
+        self.trainer2 = User.objects.create_user(
+            username="api_trainer2", password="StrongPass123!",
+            role="trainer", is_approved=True,
+        )
+        # Approved learner
+        self.learner = User.objects.create_user(
+            username="api_learner", password="StrongPass123!",
+            role="trainee", is_approved=True, first_name="Learner", last_name="One",
+        )
+        # Second approved learner
+        self.learner2 = User.objects.create_user(
+            username="api_learner2", password="StrongPass123!",
+            role="trainee", is_approved=True,
+        )
+        # Unapproved trainer (pending)
+        self.unapproved = User.objects.create_user(
+            username="unapproved_user", password="StrongPass123!",
+            role="trainer", is_approved=False,
+        )
+
+        # Courses
+        self.course = Course.objects.create(
+            title="Full API Test Course", description="A free published course",
+            trainer=self.trainer, is_published=True, price=0,
+        )
+        self.unpublished_course = Course.objects.create(
+            title="Unpublished Course", description="Draft course",
+            trainer=self.trainer, is_published=False,
+        )
+        self.paid_course = Course.objects.create(
+            title="Paid Course", description="Costs money",
+            trainer=self.trainer, is_published=True, price=Decimal("19.99"),
+        )
+        self.course2 = Course.objects.create(
+            title="Trainer2 Course", description="Owned by trainer2",
+            trainer=self.trainer2, is_published=True, price=0,
+        )
+
+        # Lessons
+        self.preview_lesson = CourseLesson.objects.create(
+            course=self.course, title="Preview Lesson", position=1,
+            is_preview=True, video_url="https://example.com/preview",
+        )
+        self.regular_lesson = CourseLesson.objects.create(
+            course=self.course, title="Regular Lesson", position=2,
+            is_preview=False, video_url="https://example.com/regular",
+        )
+
+        # Assessment with future deadline
+        self.assessment = Assessment.objects.create(
+            course=self.course, title="Test Assessment", created_by=self.trainer,
+            questions=[
+                {"id": "q1", "text": "What is 2+2?", "options": ["3", "4", "5", "6"], "correct_answer": 1},
+                {"id": "q2", "text": "What color is the sky?", "options": ["Red", "Blue", "Green", "Yellow"], "correct_answer": 1},
+            ],
+            deadline=timezone.now() + timedelta(days=7),
+        )
+
+        # Enrollment for learner in self.course
+        self.enrollment = Enrollment.objects.create(trainee=self.learner, course=self.course)
+
+    # ── Auth & User Management ──────────────────────────────────────────
+
+    def test_login_with_valid_credentials(self):
+        response = self.client.post("/api/auth/token/", {
+            "username": "api_learner", "password": "StrongPass123!",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+
+    def test_login_with_invalid_credentials(self):
+        response = self.client.post("/api/auth/token/", {
+            "username": "api_learner", "password": "WrongPassword!",
+        }, format="json")
+        self.assertEqual(response.status_code, 401)
+
+    def test_get_me_returns_user_profile(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/auth/me/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["username"], "api_learner")
+        self.assertEqual(response.data["role"], "trainee")
+        self.assertIn("competencies", response.data)
+
+    def test_patch_me_updates_profile_fields(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.patch("/api/auth/me/", {
+            "first_name": "Updated", "last_name": "Name",
+            "bio": "New bio", "competencies": ["Python", "Django"],
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["first_name"], "Updated")
+        self.assertEqual(response.data["last_name"], "Name")
+        self.assertEqual(response.data["bio"], "New bio")
+        self.assertEqual(response.data["competencies"], ["Python", "Django"])
+
+    def test_trainer_can_set_paypal_email(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch("/api/auth/me/", {
+            "paypal_email": "trainer@paypal.com",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.trainer.refresh_from_db()
+        self.assertEqual(self.trainer.paypal_email, "trainer@paypal.com")
+
+    def test_learner_cannot_set_paypal_email(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.patch("/api/auth/me/", {
+            "paypal_email": "learner@paypal.com",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.learner.refresh_from_db()
+        # paypal_email should remain empty because the field is not in allowed for learners
+        self.assertEqual(self.learner.paypal_email, "")
+
+    def test_unapproved_user_denied_access(self):
+        self.client.force_authenticate(user=self.unapproved)
+        response = self.client.get("/api/auth/me/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_register_with_admin_role_rejected(self):
+        response = self.client.post("/api/auth/register/", {
+            "username": "sneaky_admin", "email": "sneaky@example.com",
+            "password": "StrongPass123!", "role": "admin",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_register_with_duplicate_username_fails(self):
+        response = self.client.post("/api/auth/register/", {
+            "username": "api_learner", "email": "dup@example.com",
+            "password": "StrongPass123!", "role": "trainee",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    # ── Course CRUD ─────────────────────────────────────────────────────
+
+    def test_trainer_can_create_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/courses/", {
+            "title": "New Trainer Course",
+            "description": "Created by trainer",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Course.objects.filter(title="New Trainer Course", trainer=self.trainer).exists())
+
+    def test_learner_cannot_create_course(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post("/api/courses/", {
+            "title": "Learner Course",
+            "description": "Should fail",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_trainer_can_update_own_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch(f"/api/courses/{self.course.id}/", {
+            "title": "Updated Course Title",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.course.refresh_from_db()
+        self.assertEqual(self.course.title, "Updated Course Title")
+
+    def test_trainer_cannot_update_another_trainers_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch(f"/api/courses/{self.course2.id}/", {
+            "title": "Hijacked",
+        }, format="json")
+        # Trainer queryset filters to own courses for update actions → 404
+        self.assertIn(response.status_code, [403, 404])
+
+    def test_trainer_can_delete_own_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        deletable = Course.objects.create(
+            title="Deletable", description="To be deleted", trainer=self.trainer,
+        )
+        response = self.client.delete(f"/api/courses/{deletable.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Course.objects.filter(pk=deletable.id).exists())
+
+    def test_admin_can_view_all_courses(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/courses/")
+        self.assertEqual(response.status_code, 200)
+        titles = [c["title"] for c in response.data]
+        # Admin sees published AND unpublished
+        self.assertIn("Unpublished Course", titles)
+        self.assertIn("Full API Test Course", titles)
+
+    def test_learner_only_sees_published_courses(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/courses/")
+        self.assertEqual(response.status_code, 200)
+        titles = [c["title"] for c in response.data]
+        self.assertNotIn("Unpublished Course", titles)
+        self.assertIn("Full API Test Course", titles)
+
+    def test_free_course_enrollment_works(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.post(f"/api/courses/{self.course.id}/enroll/")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Enrollment.objects.filter(trainee=self.learner2, course=self.course).exists())
+
+    def test_paid_course_enrollment_blocked(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.post(f"/api/courses/{self.paid_course.id}/enroll/")
+        self.assertEqual(response.status_code, 402)
+
+    def test_duplicate_enrollment_returns_200(self):
+        self.client.force_authenticate(user=self.learner)
+        # Already enrolled in setUp
+        response = self.client.post(f"/api/courses/{self.course.id}/enroll/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_admin_cannot_enroll(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/courses/{self.course.id}/enroll/")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Course Withdraw & Rejoin ────────────────────────────────────────
+
+    def test_learner_can_withdraw_from_course(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/courses/{self.course.id}/withdraw/")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Enrollment.objects.filter(trainee=self.learner, course=self.course).exists())
+
+    def test_non_learner_cannot_withdraw(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/courses/{self.course.id}/withdraw/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_withdraw_from_unenrolled_course_returns_404(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.post(f"/api/courses/{self.course.id}/withdraw/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_rejoin_after_withdrawal_with_previous_payment(self):
+        # Simulate a previous captured payment
+        Payment.objects.create(
+            learner=self.learner, course=self.paid_course,
+            paypal_order_id="REJOIN-TEST-001", paypal_capture_id="CAP-001",
+            gross_amount=Decimal("19.99"), platform_fee=Decimal("0.20"),
+            trainer_share=Decimal("19.79"), status="captured",
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/courses/{self.paid_course.id}/rejoin/")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Enrollment.objects.filter(trainee=self.learner, course=self.paid_course).exists())
+
+    def test_rejoin_without_payment_returns_402(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.post(f"/api/courses/{self.paid_course.id}/rejoin/")
+        self.assertEqual(response.status_code, 402)
+
+    def test_non_learner_cannot_rejoin(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/courses/{self.paid_course.id}/rejoin/")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Lessons ─────────────────────────────────────────────────────────
+
+    def test_lessons_filtered_by_course_query_param(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get(f"/api/lessons/?course={self.course.id}")
+        self.assertEqual(response.status_code, 200)
+        for lesson in response.data:
+            self.assertEqual(lesson["course"], self.course.id)
+
+    def test_learner_can_see_preview_lessons_without_enrollment(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.get(f"/api/lessons/?course={self.course.id}")
+        self.assertEqual(response.status_code, 200)
+        titles = [l["title"] for l in response.data]
+        self.assertIn("Preview Lesson", titles)
+
+    def test_learner_cannot_see_non_preview_lessons_without_enrollment(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.get(f"/api/lessons/?course={self.course.id}")
+        self.assertEqual(response.status_code, 200)
+        titles = [l["title"] for l in response.data]
+        self.assertNotIn("Regular Lesson", titles)
+
+    def test_trainer_can_update_own_lesson(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch(f"/api/lessons/{self.preview_lesson.id}/", {
+            "title": "Updated Preview Lesson",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.preview_lesson.refresh_from_db()
+        self.assertEqual(self.preview_lesson.title, "Updated Preview Lesson")
+
+    def test_trainer_cannot_update_another_trainers_lesson(self):
+        lesson2 = CourseLesson.objects.create(
+            course=self.course2, title="Trainer2 Lesson", position=1,
+            video_url="https://example.com/t2",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch(f"/api/lessons/{lesson2.id}/", {
+            "title": "Hijacked Lesson",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_trainer_can_delete_own_lesson(self):
+        self.client.force_authenticate(user=self.trainer)
+        deletable = CourseLesson.objects.create(
+            course=self.course, title="Delete Me", position=99,
+        )
+        response = self.client.delete(f"/api/lessons/{deletable.id}/")
+        self.assertEqual(response.status_code, 204)
+
+    def test_trainer_cannot_delete_another_trainers_lesson(self):
+        lesson2 = CourseLesson.objects.create(
+            course=self.course2, title="Trainer2 Deletable", position=1,
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.delete(f"/api/lessons/{lesson2.id}/")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Assessments ─────────────────────────────────────────────────────
+
+    def test_trainer_can_create_assessment_for_own_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/assessments/", {
+            "course": self.course.id,
+            "title": "Trainer Assessment",
+            "questions": [
+                {"id": "q1", "text": "Test?", "options": ["A", "B", "C", "D"], "correct_answer": 0},
+            ],
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_trainer_cannot_create_assessment_for_anothers_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/assessments/", {
+            "course": self.course2.id,
+            "title": "Unauthorized Assessment",
+            "questions": [
+                {"id": "q1", "text": "Test?", "options": ["A", "B", "C", "D"], "correct_answer": 0},
+            ],
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_learner_can_submit_assessment(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/assessments/{self.assessment.id}/submit/", {
+            "answers": {"q1": 1, "q2": 1},
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("score_percent", response.data)
+        self.assertEqual(response.data["correct_answers"], 2)
+
+    def test_duplicate_assessment_submission_rejected(self):
+        self.client.force_authenticate(user=self.learner)
+        self.client.post(f"/api/assessments/{self.assessment.id}/submit/", {
+            "answers": {"q1": 1, "q2": 1},
+        }, format="json")
+        response = self.client.post(f"/api/assessments/{self.assessment.id}/submit/", {
+            "answers": {"q1": 1, "q2": 1},
+        }, format="json")
+        self.assertEqual(response.status_code, 409)
+
+    def test_assessment_past_deadline_rejected(self):
+        expired = Assessment.objects.create(
+            course=self.course, title="Expired Assessment", created_by=self.trainer,
+            questions=[{"id": "q1", "text": "Q?", "options": ["A", "B", "C", "D"], "correct_answer": 0}],
+            deadline=timezone.now() - timedelta(hours=1),
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/assessments/{expired.id}/submit/", {
+            "answers": {"q1": 0},
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_admin_cannot_take_assessment(self):
+        # Admin must be enrolled to even see the assessment via queryset, so
+        # we enroll and then test the role check in submit
+        Enrollment.objects.create(trainee=self.admin, course=self.course)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/assessments/{self.assessment.id}/submit/", {
+            "answers": {"q1": 0, "q2": 0},
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_learner_cannot_see_correct_answers_in_assessment_questions(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get(f"/api/assessments/{self.assessment.id}/")
+        self.assertEqual(response.status_code, 200)
+        for q in response.data["questions"]:
+            self.assertNotIn("correct_answer", q)
+
+    def test_trainer_can_see_correct_answers_in_own_assessment(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.get(f"/api/assessments/{self.assessment.id}/")
+        self.assertEqual(response.status_code, 200)
+        for q in response.data["questions"]:
+            self.assertIn("correct_answer", q)
+
+    # ── Assignments ─────────────────────────────────────────────────────
+
+    def test_trainer_creates_assignment(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/assignments/", {
+            "course": self.course.id,
+            "title": "Test Assignment",
+            "instructions": "Do the thing.",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Assignment.objects.filter(title="Test Assignment").exists())
+
+    def test_learner_submits_assignment(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="Submit Me", instructions="Write something.",
+            created_by=self.trainer,
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/assignments/{assignment.id}/submit/", {
+            "response_text": "Here is my work.",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_duplicate_assignment_submission_rejected(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="No Dupes", instructions="One submission only.",
+            created_by=self.trainer,
+        )
+        self.client.force_authenticate(user=self.learner)
+        self.client.post(f"/api/assignments/{assignment.id}/submit/", {
+            "response_text": "First attempt.",
+        }, format="json")
+        response = self.client.post(f"/api/assignments/{assignment.id}/submit/", {
+            "response_text": "Second attempt.",
+        }, format="json")
+        self.assertEqual(response.status_code, 409)
+
+    def test_unenrolled_learner_cannot_submit_assignment(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="Enrolled Only", instructions="Must be enrolled.",
+            created_by=self.trainer,
+        )
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.post(f"/api/assignments/{assignment.id}/submit/", {
+            "response_text": "I'm not enrolled.",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_past_deadline_assignment_submission_rejected(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="Overdue", instructions="Too late.",
+            created_by=self.trainer,
+            due_at=timezone.now() - timedelta(hours=1),
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/assignments/{assignment.id}/submit/", {
+            "response_text": "Late submission.",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_trainer_reviews_submission_with_score(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="Grading Test", instructions="Grade me.",
+            created_by=self.trainer, max_score=100,
+        )
+        sub = AssignmentSubmission.objects.create(
+            assignment=assignment, learner=self.learner,
+            response_text="My work.",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/assignment-submissions/{sub.id}/review/", {
+            "score": 85, "feedback": "Good job!",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        sub.refresh_from_db()
+        self.assertEqual(sub.score, 85)
+        self.assertEqual(sub.status, "reviewed")
+
+    def test_trainer_can_request_revision(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="Revision Test", instructions="Try again.",
+            created_by=self.trainer, max_score=100,
+        )
+        sub = AssignmentSubmission.objects.create(
+            assignment=assignment, learner=self.learner,
+            response_text="Not good enough.",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/assignment-submissions/{sub.id}/review/", {
+            "score": 40, "feedback": "Needs improvement.",
+            "request_revision": True,
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, "revision")
+
+    def test_trainer_cannot_review_another_trainers_submissions(self):
+        assignment = Assignment.objects.create(
+            course=self.course2, title="Other Trainer Assignment",
+            instructions="Not yours.", created_by=self.trainer2, max_score=100,
+        )
+        Enrollment.objects.create(trainee=self.learner, course=self.course2)
+        sub = AssignmentSubmission.objects.create(
+            assignment=assignment, learner=self.learner,
+            response_text="Submitted to trainer2.",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/assignment-submissions/{sub.id}/review/", {
+            "score": 50, "feedback": "Not my course.",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_assignment_submissions_list_filtered_by_role(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="List Test", instructions=".",
+            created_by=self.trainer, max_score=100,
+        )
+        AssignmentSubmission.objects.create(
+            assignment=assignment, learner=self.learner, response_text="Work.",
+        )
+        # Learner sees only own
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/assignment-submissions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(all(s["learner"] == self.learner.id for s in response.data))
+
+        # Trainer sees submissions in their courses
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.get("/api/assignment-submissions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 1)
+
+        # Admin sees all
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/assignment-submissions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 1)
+
+    # ── Discussions ─────────────────────────────────────────────────────
+
+    def test_enrolled_learner_can_post_discussion(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post("/api/discussions/", {
+            "course": self.course.id,
+            "body": "Great course!",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_unenrolled_learner_cannot_post_discussion(self):
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.post("/api/discussions/", {
+            "course": self.course.id,
+            "body": "I'm not enrolled.",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_course_trainer_can_post_discussion(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/discussions/", {
+            "course": self.course.id,
+            "body": "Welcome to the course!",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+
+    def test_author_can_delete_own_post(self):
+        post = CourseDiscussion.objects.create(
+            course=self.course, author=self.learner, body="Delete me.",
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.delete(f"/api/discussions/{post.id}/")
+        self.assertEqual(response.status_code, 204)
+
+    def test_course_trainer_can_delete_any_post_in_their_course(self):
+        post = CourseDiscussion.objects.create(
+            course=self.course, author=self.learner, body="Trainer will delete this.",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.delete(f"/api/discussions/{post.id}/")
+        self.assertEqual(response.status_code, 204)
+
+    def test_non_owner_non_trainer_cannot_delete_anothers_post(self):
+        post = CourseDiscussion.objects.create(
+            course=self.course, author=self.learner, body="Protected post.",
+        )
+        # Enroll learner2 so they can see the post
+        Enrollment.objects.create(trainee=self.learner2, course=self.course)
+        self.client.force_authenticate(user=self.learner2)
+        response = self.client.delete(f"/api/discussions/{post.id}/")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Admin Endpoints ─────────────────────────────────────────────────
+
+    def test_admin_can_see_overview_stats(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/admin/overview/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("users", response.data)
+        self.assertIn("courses", response.data)
+        self.assertIn("pending_users", response.data)
+
+    def test_non_admin_denied_overview(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/admin/overview/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_can_list_users(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/admin/users/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 1)
+
+    def test_admin_can_list_pending_users(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/admin/users/?status=pending")
+        self.assertEqual(response.status_code, 200)
+        for user_data in response.data:
+            self.assertFalse(user_data["is_approved"])
+
+    def test_admin_can_approve_user(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/admin/users/{self.unapproved.id}/approve/")
+        self.assertEqual(response.status_code, 200)
+        self.unapproved.refresh_from_db()
+        self.assertTrue(self.unapproved.is_approved)
+
+    def test_admin_can_change_user_role(self):
+        target = User.objects.create_user(
+            username="role_target", password="StrongPass123!",
+            role="trainee", is_approved=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/admin/users/{target.id}/role/", {
+            "role": "trainer",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        target.refresh_from_db()
+        self.assertEqual(target.role, "trainer")
+
+    def test_cannot_change_superuser_role(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/admin/users/{self.superuser.id}/role/", {
+            "role": "trainee",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_admin_cannot_change_role_to_invalid(self):
+        target = User.objects.create_user(
+            username="invalid_role_target", password="StrongPass123!",
+            role="trainee", is_approved=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/admin/users/{target.id}/role/", {
+            "role": "superadmin",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    # ── Transactions Endpoint ───────────────────────────────────────────
+
+    def test_learner_sees_own_enrollments_in_transactions(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/transactions/")
+        self.assertEqual(response.status_code, 200)
+        # Should contain at least the enrollment from setUp
+        self.assertGreaterEqual(len(response.data["items"]), 1)
+        for item in response.data["items"]:
+            self.assertEqual(item["learner_id"], self.learner.id)
+
+    def test_trainer_sees_enrollments_in_their_courses(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.get("/api/transactions/")
+        self.assertEqual(response.status_code, 200)
+        for item in response.data["items"]:
+            self.assertEqual(item["trainer_id"], self.trainer.id)
+
+    def test_admin_sees_all_transactions(self):
+        # Create a second enrollment in trainer2's course
+        Enrollment.objects.create(trainee=self.learner, course=self.course2)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/transactions/")
+        self.assertEqual(response.status_code, 200)
+        # Admin should see enrollments across multiple trainers
+        self.assertGreaterEqual(len(response.data["items"]), 2)
+
+    # ── Enrollments Endpoint ────────────────────────────────────────────
+
+    def test_enrollments_returns_learner_courses(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/enrollments/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 1)
+
+    # ── Attempts Endpoint ───────────────────────────────────────────────
+
+    def test_learner_sees_own_attempts(self):
+        Attempt.objects.create(
+            trainee=self.learner, assessment=self.assessment,
+            score=100, total_questions=2, answers={"q1": 1, "q2": 1},
+            question_results={"q1": True, "q2": True}, points=20,
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/attempts/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 1)
+        for attempt in response.data:
+            self.assertEqual(attempt["trainee"], self.learner.id)
+
+    # ── Question Submissions ────────────────────────────────────────────
+
+    def test_learner_submission_is_pending(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post("/api/question-submissions/", {
+            "course": self.course.id,
+            "question_text": "What is Django?",
+            "options": ["A framework", "A language", "A database", "An OS"],
+            "correct_answer": 0,
+            "topic": "Web",
+            "difficulty": "beginner",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["submission"]["status"], "pending")
+
+    def test_trainer_auto_approves_on_own_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/question-submissions/", {
+            "course": self.course.id,
+            "question_text": "What is REST?",
+            "options": ["Architecture", "Language", "Protocol", "Library"],
+            "correct_answer": 0,
+            "topic": "API",
+            "difficulty": "beginner",
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["submission"]["status"], "approved")
+
+    def test_review_approve(self):
+        q = QuestionSubmission.objects.create(
+            submitted_by=self.learner, course=self.course,
+            question_text="Review approve test?",
+            options=["A", "B", "C", "D"], correct_answer=0, status="pending",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/question-submissions/{q.id}/review/", {
+            "status": "approved", "review_feedback": "Looks good!",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        q.refresh_from_db()
+        self.assertEqual(q.status, "approved")
+
+    def test_review_reject(self):
+        q = QuestionSubmission.objects.create(
+            submitted_by=self.learner, course=self.course,
+            question_text="Review reject test?",
+            options=["A", "B", "C", "D"], correct_answer=0, status="pending",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/question-submissions/{q.id}/review/", {
+            "status": "rejected", "review_feedback": "Not relevant.",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        q.refresh_from_db()
+        self.assertEqual(q.status, "rejected")
+
+    def test_review_revision(self):
+        q = QuestionSubmission.objects.create(
+            submitted_by=self.learner, course=self.course,
+            question_text="Review revision test?",
+            options=["A", "B", "C", "D"], correct_answer=0, status="pending",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/question-submissions/{q.id}/review/", {
+            "status": "revision", "review_feedback": "Please rephrase.",
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        q.refresh_from_db()
+        self.assertEqual(q.status, "revision")
+
+    def test_duplicate_question_text_rejected(self):
+        QuestionSubmission.objects.create(
+            submitted_by=self.trainer, course=self.course,
+            question_text="Unique question about testing?",
+            options=["A", "B", "C", "D"], correct_answer=0, status="approved",
+        )
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post("/api/question-submissions/", {
+            "course": self.course.id,
+            "question_text": "Unique question about testing?",
+            "options": ["A", "B", "C", "D"],
+            "correct_answer": 0,
+            "topic": "Testing",
+            "difficulty": "beginner",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_grade_practice_with_invalid_answers(self):
+        self.client.force_authenticate(user=self.learner)
+        # Non-dict answers
+        response = self.client.post("/api/question-submissions/grade-practice/", {
+            "answers": "not-a-dict",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_grade_practice_with_empty_answers(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post("/api/question-submissions/grade-practice/", {
+            "answers": {},
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_grade_practice_with_nonexistent_question(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post("/api/question-submissions/grade-practice/", {
+            "answers": {"999999": 0},
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    # ── Payment History ─────────────────────────────────────────────────
+
+    def test_payment_history_returns_200(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/payments/history/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(response.data, list)
+
+    def test_payment_history_filtered_by_role(self):
+        payment = Payment.objects.create(
+            learner=self.learner, course=self.paid_course,
+            paypal_order_id="HIST-001", gross_amount=Decimal("19.99"),
+            platform_fee=Decimal("0.20"), trainer_share=Decimal("19.79"),
+            status="captured",
+        )
+        # Learner sees only own
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/payments/history/")
+        self.assertEqual(response.status_code, 200)
+        for p in response.data:
+            self.assertEqual(p["learner_id"], self.learner.id)
+
+        # Trainer sees payments for their courses
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.get("/api/payments/history/")
+        self.assertEqual(response.status_code, 200)
+
+        # Admin sees all
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/payments/history/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(response.data), 1)
+
+    # ── Trainer cannot review another trainer's course questions ────────
+
+    def test_trainer_cannot_review_another_trainers_question(self):
+        q = QuestionSubmission.objects.create(
+            submitted_by=self.learner, course=self.course2,
+            question_text="Belongs to trainer2 course?",
+            options=["A", "B", "C", "D"], correct_answer=0, status="pending",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(f"/api/question-submissions/{q.id}/review/", {
+            "status": "approved",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Assignment-specific edge cases ──────────────────────────────────
+
+    def test_admin_cannot_submit_assignment(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="Admin Blocked",
+            instructions="Admin can't submit.", created_by=self.trainer,
+        )
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/assignments/{assignment.id}/submit/", {
+            "response_text": "Admin attempt.",
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_assignment_submissions_endpoint_for_specific_assignment(self):
+        assignment = Assignment.objects.create(
+            course=self.course, title="View Submissions",
+            instructions=".", created_by=self.trainer, max_score=100,
+        )
+        AssignmentSubmission.objects.create(
+            assignment=assignment, learner=self.learner, response_text="Done.",
+        )
+        # Trainer (owner) can view submissions
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.get(f"/api/assignments/{assignment.id}/submissions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+        # Other trainer cannot
+        self.client.force_authenticate(user=self.trainer2)
+        response = self.client.get(f"/api/assignments/{assignment.id}/submissions/")
+        self.assertEqual(response.status_code, 403)
+
+        # Learner cannot
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get(f"/api/assignments/{assignment.id}/submissions/")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Become Trainer edge cases ───────────────────────────────────────
+
+    def test_admin_cannot_become_trainer(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post("/api/auth/become-trainer/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    # ── Token Refresh ───────────────────────────────────────────────────
+
+    def test_token_refresh(self):
+        login = self.client.post("/api/auth/token/", {
+            "username": "api_learner", "password": "StrongPass123!",
+        }, format="json")
+        refresh_token = login.data["refresh"]
+        response = self.client.post("/api/auth/token/refresh/", {
+            "refresh": refresh_token,
+        }, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+
+    def test_token_refresh_with_invalid_token(self):
+        response = self.client.post("/api/auth/token/refresh/", {
+            "refresh": "invalid-token-string",
+        }, format="json")
+        self.assertEqual(response.status_code, 401)
+
+    # ── Learner who is enrolled can see regular lessons ──────────────────
+
+    def test_enrolled_learner_can_see_all_lessons(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get(f"/api/lessons/?course={self.course.id}")
+        self.assertEqual(response.status_code, 200)
+        titles = [l["title"] for l in response.data]
+        self.assertIn("Preview Lesson", titles)
+        self.assertIn("Regular Lesson", titles)
+
+    # ── Non-admin denied admin user list ─────────────────────────────────
+
+    def test_non_admin_denied_user_list(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.get("/api/admin/users/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_learner_denied_admin_approve(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.post(f"/api/admin/users/{self.unapproved.id}/approve/")
+        self.assertEqual(response.status_code, 403)
+
+    # ── Superuser approve is 400 ─────────────────────────────────────────
+
+    def test_approve_superuser_returns_400(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/admin/users/{self.superuser.id}/approve/")
+        self.assertEqual(response.status_code, 400)

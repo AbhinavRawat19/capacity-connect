@@ -1,12 +1,15 @@
 from django.db.models import Count, Avg
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Sum
+from decimal import Decimal, ROUND_HALF_UP
+import json, os, urllib.request, urllib.error, base64
+from django.conf import settings
 from rest_framework import generics, status, viewsets
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission, QuestionPracticeRecord
+from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission, QuestionPracticeRecord, Payment
 from .serializers import UserSerializer, RegisterSerializer, CourseSerializer, EnrollmentSerializer, AssessmentSerializer, AttemptSerializer, QuestionSubmissionSerializer
 from .permissions import IsApproved, IsAdminRole, IsTrainerOrAdmin
 
@@ -20,11 +23,17 @@ class RegisterView(generics.CreateAPIView):
 @api_view(['GET','PATCH'])
 @permission_classes([IsAuthenticated, IsApproved])
 def me(request):
-    if request.method == 'GET': return Response(UserSerializer(request.user).data)
+    if request.method == 'GET': return Response(UserSerializer(request.user, context={'request': request}).data)
     allowed = {'first_name','last_name','email','department','bio','competencies'}
-    for key,value in request.data.items():
-        if key in allowed: setattr(request.user,key,value)
-    request.user.save(); return Response(UserSerializer(request.user).data)
+    if request.user.role == 'trainer' or request.user.is_superuser: allowed.add('paypal_email')
+    payload = {key: value for key, value in request.data.items() if key in allowed}
+    serializer = UserSerializer(
+        request.user, data=payload, partial=True,
+        context={'request': request},
+    )
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data)
 
 
 @api_view(['POST'])
@@ -65,12 +74,497 @@ class CourseViewSet(viewsets.ModelViewSet):
     def enroll(self, request, pk=None):
         if request.user.role == 'admin' or request.user.is_superuser: return Response({'detail':'Admin accounts do not need to enroll in courses.'},status=403)
         course=self.get_object()
+        if course.price > 0:
+            return Response({'detail':'This is a paid course. Complete checkout before enrolling.'}, status=402)
         enrollment, created=Enrollment.objects.get_or_create(trainee=request.user,course=course)
         return Response({'message':'Enrolled successfully.' if created else 'You are already enrolled.','enrollment_id':enrollment.id},status=201 if created else 200)
+
+
+def _paypal_request(path, method='GET', payload=None, request_id=None):
+    client_id = getattr(settings, 'PAYPAL_CLIENT_ID', '')
+    secret = getattr(settings, 'PAYPAL_CLIENT_SECRET', '')
+    if not client_id or not secret:
+        raise ValueError('PayPal is not configured. Add sandbox credentials to backend .env.')
+    token_url = settings.PAYPAL_BASE_URL.rstrip('/') + '/v1/oauth2/token'
+    auth = base64.b64encode(f'{client_id}:{secret}'.encode()).decode()
+    req = urllib.request.Request(token_url, data=b'grant_type=client_credentials', headers={'Authorization':f'Basic {auth}','Content-Type':'application/x-www-form-urlencoded'}, method='POST')
+    with urllib.request.urlopen(req, timeout=20) as response:
+        token = json.loads(response.read())['access_token']
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {'Authorization':f'Bearer {token}','Content-Type':'application/json'}
+    if request_id: headers['PayPal-Request-Id'] = request_id
+    req = urllib.request.Request(settings.PAYPAL_BASE_URL.rstrip('/') + path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read())
+
+
+@transaction.atomic
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsApproved])
+def paypal_create_order(request):
+    try:
+        course = Course.objects.select_for_update().get(pk=request.data.get('course_id'), is_published=True)
+    except Course.DoesNotExist:
+        return Response({'detail':'Course not found.'}, status=404)
+    if course.price <= 0:
+        return Response({'detail':'This course is free; use the enroll action.'}, status=400)
+    if Enrollment.objects.filter(trainee=request.user, course=course).exists():
+        return Response({'detail':'You are already enrolled.'}, status=409)
+    if Payment.objects.filter(learner=request.user, course=course, status='captured').exists():
+        return Response({
+            'detail': 'You have already paid for this course. Restore your access instead of purchasing it again.',
+            'previously_paid': True,
+            'rejoin_url': f'/courses/{course.id}/rejoin/',
+        }, status=409)
+    # Reuse an existing open checkout instead of creating another PayPal order
+    # when the learner double-clicks or retries after a slow response.
+    pending = Payment.objects.filter(
+        learner=request.user, course=course, status='created'
+    ).order_by('-created_at').first()
+    if pending:
+        try:
+            existing_order = _paypal_request(f'/v2/checkout/orders/{pending.paypal_order_id}')
+            approve = next((
+                link.get('href') for link in existing_order.get('links', [])
+                if link.get('rel') in ('approve', 'payer-action')
+            ), None)
+            existing_status = existing_order.get('status')
+            if existing_status in ('CREATED', 'PAYER_ACTION_REQUIRED') and approve:
+                return Response({
+                    'order_id': pending.paypal_order_id,
+                    'status': existing_status,
+                    'approve_url': approve,
+                    'reused': True,
+                }, status=200)
+            if existing_status in ('APPROVED', 'COMPLETED'):
+                return Response({
+                    'order_id': pending.paypal_order_id,
+                    'status': existing_status,
+                    'return_url': settings.FRONTEND_URL.rstrip('/') + '/?token=' + pending.paypal_order_id,
+                    'reused': True,
+                }, status=200)
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, KeyError):
+            # Fall through and create a fresh order if the old one is no longer usable.
+            pass
+    try:
+        amount = f'{course.price:.2f}'
+        order = _paypal_request('/v2/checkout/orders', 'POST', {
+            'intent':'CAPTURE',
+            'purchase_units':[{'reference_id':str(course.id),'custom_id':f'{request.user.id}:{course.id}',
+                'description':course.title[:127],
+                'amount':{'currency_code':course.currency,'value':amount}}],
+            'payment_source':{'paypal':{'experience_context':{'user_action':'PAY_NOW','return_url':settings.FRONTEND_URL.rstrip('/') + '/?payment=success','cancel_url':settings.FRONTEND_URL.rstrip('/') + '/?payment=cancel'}}}
+        }, request_id=f'cc-create-{request.user.id}-{course.id}-{int(timezone.now().timestamp())}')
+        # Persist the checkout before returning the buyer to PayPal. Capture relies
+        # on this learner-owned record to bind the PayPal order to the course/price.
+        order_id = order.get('id')
+        if not order_id:
+            raise ValueError('PayPal did not return an order ID.')
+        Payment.objects.update_or_create(
+            paypal_order_id=order_id,
+            defaults={
+                'learner': request.user,
+                'course': course,
+                'gross_amount': course.price,
+                'platform_fee': Decimal('0.00'),
+                'trainer_share': Decimal('0.00'),
+                'currency': course.currency,
+                'status': 'created',
+            },
+        )
+        # PayPal's approval relation can be named `approve` or `payer-action`
+        # depending on the checkout integration/version.
+        approve = next((
+            link.get('href') for link in order.get('links', [])
+            if link.get('rel') in ('approve', 'payer-action')
+        ), None)
+        if not approve:
+            return Response({'detail':'PayPal created the order but did not return an approval URL.','order_id':order_id}, status=502)
+        return Response({'order_id':order_id,'status':order.get('status'),'approve_url':approve}, status=201)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, KeyError) as exc:
+        detail = exc.read().decode(errors='replace') if isinstance(exc, urllib.error.HTTPError) else str(exc)
+        return Response({'detail':f'PayPal order creation failed: {detail[:500]}'}, status=502)
+
+
+@transaction.atomic
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsApproved])
+def paypal_capture_order(request):
+    order_id = str(request.data.get('order_id', '')).strip()
+    if not order_id:
+        return Response({'detail': 'order_id is required.'}, status=400)
+
+    existing = Payment.objects.filter(paypal_order_id=order_id, status='captured').first()
+    if existing:
+        if existing.learner_id != request.user.id:
+            return Response({'detail': 'Order does not belong to this account.'}, status=403)
+        enrollment, _ = Enrollment.objects.get_or_create(
+            trainee=request.user, course=existing.course
+        )
+        return Response({
+            'message': 'Payment already captured.',
+            'enrollment_id': enrollment.id,
+            'payment_id': existing.id,
+        })
+
+    pending = Payment.objects.select_for_update().filter(
+        paypal_order_id=order_id, learner=request.user, status='created'
+    ).select_related('course').first()
+    if not pending:
+        # A concurrent request may have completed the same capture while this
+        # request waited for the row lock. Re-read and return the idempotent result.
+        completed = Payment.objects.filter(
+            paypal_order_id=order_id, learner=request.user, status='captured'
+        ).select_related('course').first()
+        if completed:
+            enrollment, _ = Enrollment.objects.get_or_create(
+                trainee=request.user, course=completed.course
+            )
+            return Response({
+                'message': 'Payment already captured.',
+                'enrollment_id': enrollment.id,
+                'payment_id': completed.id,
+            })
+        return Response({'detail': 'No pending checkout found for this account and order.'}, status=404)
+
+    try:
+        # Read the canonical order first. In PayPal's capture response, custom_id
+        # is not guaranteed to be repeated on the purchase unit.
+        order = _paypal_request(f'/v2/checkout/orders/{order_id}')
+        units = order.get('purchase_units') or []
+        if len(units) != 1:
+            return Response({'detail': 'PayPal order must contain exactly one purchase unit.'}, status=400)
+
+        unit = units[0]
+        expected_custom_id = f'{request.user.id}:{pending.course_id}'
+        if unit.get('custom_id') != expected_custom_id:
+            return Response({'detail': 'Order metadata does not match this checkout.'}, status=400)
+
+        order_amount = unit.get('amount') or {}
+        if (order_amount.get('currency_code') != pending.currency or
+                Decimal(str(order_amount.get('value', '0'))) != pending.gross_amount):
+            return Response({'detail': 'PayPal order amount does not match the checkout amount.'}, status=400)
+
+        # A previous request may already have captured the order even if the
+        # browser received an error. Reconcile that completed capture instead
+        # of attempting to charge the buyer again.
+        if order.get('status') == 'COMPLETED':
+            captures = (unit.get('payments') or {}).get('captures') or []
+        elif order.get('status') == 'APPROVED':
+            result = _paypal_request(
+                f'/v2/checkout/orders/{order_id}/capture',
+                'POST', {}, request_id=f'cc-capture-{order_id}'
+            )
+            if result.get('status') != 'COMPLETED':
+                return Response({
+                    'detail': 'PayPal has not marked this order as completed.',
+                    'paypal_status': result.get('status'),
+                }, status=402)
+            result_units = result.get('purchase_units') or []
+            captures = ((result_units[0].get('payments') or {}).get('captures') or []) if result_units else []
+            # If the capture response omits capture details, refresh the order.
+            if not captures:
+                refreshed = _paypal_request(f'/v2/checkout/orders/{order_id}')
+                refreshed_units = refreshed.get('purchase_units') or []
+                captures = (((refreshed_units[0].get('payments') or {}).get('captures') or [])
+                            if refreshed_units else [])
+        else:
+            return Response({
+                'detail': 'PayPal order is not approved for capture.',
+                'paypal_status': order.get('status'),
+            }, status=402)
+
+        if not captures:
+            return Response({'detail': 'PayPal order is completed but no capture details were returned.'}, status=502)
+
+        capture = captures[0]
+        if capture.get('status') != 'COMPLETED':
+            return Response({
+                'detail': 'PayPal capture is not completed.',
+                'capture_status': capture.get('status'),
+            }, status=402)
+
+        capture_amount = capture.get('amount') or {}
+        paid_amount = Decimal(str(capture_amount.get('value', '0')))
+        if (capture_amount.get('currency_code') != pending.currency or
+                paid_amount != pending.gross_amount):
+            return Response({'detail': 'Captured amount does not match the checkout amount.'}, status=400)
+
+        capture_id = capture.get('id')
+        if not capture_id:
+            return Response({'detail': 'PayPal did not return a capture ID.'}, status=502)
+
+        fee_pct = Decimal(str(getattr(settings, 'PLATFORM_FEE_PERCENT', '1')))
+        fee = (paid_amount * fee_pct / Decimal('100')).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        share = paid_amount - fee
+
+        with transaction.atomic():
+            payment = Payment.objects.select_for_update().get(pk=pending.pk)
+            if payment.status == 'captured':
+                enrollment, _ = Enrollment.objects.get_or_create(
+                    trainee=request.user, course=payment.course
+                )
+                return Response({
+                    'message': 'Payment already captured.',
+                    'enrollment_id': enrollment.id,
+                    'payment_id': payment.id,
+                })
+            payment.paypal_capture_id = capture_id
+            payment.platform_fee = fee
+            payment.trainer_share = share
+            payment.status = 'captured'
+            payment.captured_at = timezone.now()
+            payment.save(update_fields=[
+                'paypal_capture_id', 'platform_fee', 'trainer_share',
+                'status', 'captured_at'
+            ])
+            enrollment, _ = Enrollment.objects.get_or_create(
+                trainee=request.user, course=pending.course
+            )
+
+        return Response({
+            'message': 'Payment captured and course unlocked.',
+            'enrollment_id': enrollment.id,
+            'payment_id': payment.id,
+        })
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, KeyError,
+            Course.DoesNotExist, IndexError) as exc:
+        detail = exc.read().decode(errors='replace') if isinstance(exc, urllib.error.HTTPError) else str(exc)
+        return Response({'detail': f'Payment capture failed: {detail[:500]}'}, status=502)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsApproved])
+def payment_history(request):
+    qs = Payment.objects.select_related('course', 'learner')
+    if request.user.is_superuser or request.user.role == 'admin':
+        pass
+    elif request.user.role == 'trainee':
+        qs = qs.filter(learner=request.user)
+    else:
+        qs = qs.filter(course__trainer_id=request.user.pk)
+    return Response([{
+        'id': p.id,
+        'course_id': p.course_id,
+        'course_title': p.course.title,
+        'learner_id': p.learner_id,
+        'learner_name': p.learner.get_full_name() or p.learner.username,
+        'gross_amount': str(p.gross_amount),
+        'platform_fee': str(p.platform_fee),
+        'trainer_share': str(p.trainer_share),
+        'currency': p.currency,
+        'status': p.status,
+        'created_at': p.created_at,
+        'captured_at': p.captured_at,
+    } for p in qs])
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsApproved])
+def transactions_and_enrollments(request):
+    """
+    Role-aware learning and transaction ledger.
+    - Learners: their purchases (including historical/withdrawn purchases) and free enrollments.
+    - Trainers: active enrollments in their own courses, with payment status only.
+    - Admins: every payment plus free/unpaid active enrollments.
+    """
+    user = request.user
+    is_admin = user.is_superuser or user.role == 'admin'
+    is_trainer = user.role == 'trainer' and not is_admin
+
+    if is_trainer:
+        enrollments = Enrollment.objects.filter(
+            course__trainer_id=user.pk
+        ).select_related('trainee', 'course', 'course__trainer').order_by('-enrolled_at')
+        payments = Payment.objects.filter(
+            course__trainer_id=user.pk
+        ).select_related('learner', 'course', 'course__trainer').order_by('-created_at')
+        latest_payment = {}
+        for payment in payments:
+            key = (payment.learner_id, payment.course_id)
+            if key not in latest_payment or (latest_payment[key].status != 'captured' and payment.status == 'captured'):
+                latest_payment[key] = payment
+
+        rows = []
+        for enrollment in enrollments:
+            payment = latest_payment.get((enrollment.trainee_id, enrollment.course_id))
+            rows.append({
+                'id': f'enrollment-{enrollment.id}',
+                'record_type': 'purchase' if payment and payment.status == 'captured' else 'enrollment',
+                'enrollment_id': enrollment.id,
+                'payment_id': payment.id if payment else None,
+                'invoice_number': f'CC-INV-{payment.id:06d}' if payment and payment.status == 'captured' else None,
+                'course_id': enrollment.course_id,
+                'course_title': enrollment.course.title,
+                'learner_id': enrollment.trainee_id,
+                'learner_name': enrollment.trainee.get_full_name() or enrollment.trainee.username,
+                'trainer_id': user.id,
+                'trainer_name': user.get_full_name() or user.username,
+                'amount': str(payment.gross_amount) if payment and payment.status == 'captured' else None,
+                'platform_fee': str(payment.platform_fee) if payment and payment.status == 'captured' else None,
+                'trainer_share': str(payment.trainer_share) if payment and payment.status == 'captured' else None,
+                'currency': payment.currency if payment else enrollment.course.currency,
+                'payment_status': payment.status if payment else ('free' if enrollment.course.price <= 0 else 'unrecorded'),
+                'purchased_at': payment.captured_at if payment and payment.status == 'captured' else None,
+                'enrolled_at': enrollment.enrolled_at,
+                'enrollment_active': True,
+                'progress': enrollment.progress,
+                'completed': enrollment.completed,
+            })
+    else:
+        if is_admin:
+            payments = Payment.objects.select_related(
+                'learner', 'course', 'course__trainer'
+            ).all().order_by('-created_at')
+            enrollments = Enrollment.objects.select_related(
+                'trainee', 'course', 'course__trainer'
+            ).all().order_by('-enrolled_at')
+        else:
+            payments = Payment.objects.filter(
+                learner=user
+            ).select_related('learner', 'course', 'course__trainer').order_by('-created_at')
+            enrollments = Enrollment.objects.filter(
+                trainee=user
+            ).select_related('trainee', 'course', 'course__trainer').order_by('-enrolled_at')
+
+        rows = []
+        captured_keys = set()
+        active_keys = set()
+        for enrollment in enrollments:
+            active_keys.add((enrollment.trainee_id, enrollment.course_id))
+
+        for payment in payments:
+            key = (payment.learner_id, payment.course_id)
+            active = key in active_keys
+            if payment.status == 'captured':
+                captured_keys.add(key)
+            trainer = payment.course.trainer
+            rows.append({
+                'id': f'payment-{payment.id}',
+                'record_type': 'purchase',
+                'enrollment_id': None,
+                'payment_id': payment.id,
+                'invoice_number': f'CC-INV-{payment.id:06d}' if payment.status == 'captured' else None,
+                'paypal_order_id': payment.paypal_order_id,
+                'paypal_capture_id': payment.paypal_capture_id,
+                'course_id': payment.course_id,
+                'course_title': payment.course.title,
+                'learner_id': payment.learner_id,
+                'learner_name': payment.learner.get_full_name() or payment.learner.username,
+                'learner_email': payment.learner.email,
+                'trainer_id': trainer.id if trainer else None,
+                'trainer_name': (trainer.get_full_name() or trainer.username) if trainer else 'Unassigned',
+                'amount': str(payment.gross_amount),
+                'platform_fee': str(payment.platform_fee),
+                'trainer_share': str(payment.trainer_share),
+                'currency': payment.currency,
+                'payment_status': payment.status,
+                'purchased_at': payment.captured_at,
+                'enrolled_at': None,
+                'enrollment_active': active,
+                'progress': None,
+                'completed': None,
+                'created_at': payment.created_at,
+            })
+
+        # Free enrollments (and any enrollment without a captured purchase) are
+        # represented separately so the ledger never labels them as a payment.
+        for enrollment in enrollments:
+            key = (enrollment.trainee_id, enrollment.course_id)
+            if key in captured_keys:
+                # Attach the active enrollment state to the matching captured purchase.
+                for row in rows:
+                    if row['record_type'] == 'purchase' and row['learner_id'] == enrollment.trainee_id and row['course_id'] == enrollment.course_id and row['payment_status'] == 'captured':
+                        row['enrollment_id'] = enrollment.id
+                        row['enrolled_at'] = enrollment.enrolled_at
+                        row['progress'] = enrollment.progress
+                        row['completed'] = enrollment.completed
+                        row['enrollment_active'] = True
+                continue
+            trainer = enrollment.course.trainer
+            rows.append({
+                'id': f'enrollment-{enrollment.id}',
+                'record_type': 'enrollment',
+                'enrollment_id': enrollment.id,
+                'payment_id': None,
+                'invoice_number': None,
+                'course_id': enrollment.course_id,
+                'course_title': enrollment.course.title,
+                'learner_id': enrollment.trainee_id,
+                'learner_name': enrollment.trainee.get_full_name() or enrollment.trainee.username,
+                'trainer_id': trainer.id if trainer else None,
+                'trainer_name': (trainer.get_full_name() or trainer.username) if trainer else 'Unassigned',
+                'amount': '0.00' if enrollment.course.price <= 0 else None,
+                'platform_fee': '0.00' if enrollment.course.price <= 0 else None,
+                'trainer_share': '0.00' if enrollment.course.price <= 0 else None,
+                'currency': enrollment.course.currency,
+                'payment_status': 'free' if enrollment.course.price <= 0 else 'unrecorded',
+                'purchased_at': None,
+                'enrolled_at': enrollment.enrolled_at,
+                'enrollment_active': True,
+                'progress': enrollment.progress,
+                'completed': enrollment.completed,
+                'created_at': enrollment.enrolled_at,
+            })
+
+    # Consistent newest-first response. The UI applies interactive filters and sorting.
+    rows.sort(key=lambda row: str(row.get('purchased_at') or row.get('created_at') or row.get('enrolled_at') or ''), reverse=True)
+    captured_rows = [row for row in rows if row['record_type'] == 'purchase' and row['payment_status'] == 'captured']
+    summary = {
+        'records': len(rows),
+        'active_enrollments': enrollments.count(),
+        'successful_purchases': len(captured_rows),
+        'gross_revenue': str(sum((Decimal(row['amount']) for row in captured_rows), Decimal('0.00'))) if (is_admin or is_trainer) else None,
+        'platform_fees': str(sum((Decimal(row['platform_fee']) for row in captured_rows), Decimal('0.00'))) if is_admin else None,
+        'trainer_shares': str(sum((Decimal(row['trainer_share']) for row in captured_rows), Decimal('0.00'))) if (is_admin or is_trainer) else None,
+    }
+    return Response({'items': rows, 'summary': summary})
+
 
 class MyEnrollmentsView(generics.ListAPIView):
     serializer_class=EnrollmentSerializer; permission_classes=[IsAuthenticated,IsApproved]
     def get_queryset(self): return Enrollment.objects.filter(trainee=self.request.user).select_related('course','course__trainer')
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsApproved])
+def withdraw_from_course(request, course_id):
+    if request.user.role != 'trainee':
+        return Response({'detail': 'Only learners can withdraw from courses.'}, status=403)
+    enrollment = Enrollment.objects.filter(trainee=request.user, course_id=course_id).select_related('course').first()
+    if not enrollment:
+        return Response({'detail': 'You are not enrolled in this course.'}, status=404)
+    course_title = enrollment.course.title
+    # Deliberately remove access only. Captured Payment records are retained and
+    # no refund or reversal is initiated by this action.
+    enrollment.delete()
+    return Response({
+        'message': f'You have withdrawn from "{course_title}". Course access has been removed. No refund has been issued.',
+        'refund_issued': False,
+    }, status=200)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsApproved])
+def rejoin_paid_course(request, course_id):
+    if request.user.role != 'trainee':
+        return Response({'detail': 'Only learners can rejoin courses.'}, status=403)
+    course = Course.objects.filter(pk=course_id, is_published=True).first()
+    if not course:
+        return Response({'detail': 'Course not found.'}, status=404)
+    paid_before = Payment.objects.filter(
+        learner=request.user, course=course, status='captured'
+    ).exists()
+    if not paid_before:
+        return Response({'detail': 'No completed payment was found for this course. Complete checkout first.'}, status=402)
+    enrollment, created = Enrollment.objects.get_or_create(trainee=request.user, course=course)
+    return Response({
+        'message': 'Your previous purchase was found. Course access has been restored without another charge.' if created else 'You are already enrolled.',
+        'enrollment_id': enrollment.id,
+        'created': created,
+    }, status=201 if created else 200)
 
 def sync_assessment_questions_to_bank(assessment):
     """Ensure every saved assessment question has a canonical Question Bank entry.

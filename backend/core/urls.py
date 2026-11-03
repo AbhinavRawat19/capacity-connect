@@ -22,6 +22,12 @@ from .views import (
     review_assignment_submission,
     CourseDiscussionViewSet,
     learning_intelligence,
+    paypal_create_order,
+    paypal_capture_order,
+    payment_history,
+    transactions_and_enrollments,
+    withdraw_from_course,
+    rejoin_paid_course,
 )
 
 router = DefaultRouter()
@@ -36,6 +42,12 @@ router.register('discussions', CourseDiscussionViewSet, basename='discussion')
 
 urlpatterns = [
     path('ai/learning-intelligence/', learning_intelligence),
+    path('payments/create-order/', paypal_create_order),
+    path('payments/capture-order/', paypal_capture_order),
+    path('payments/history/', payment_history),
+    path('transactions/', transactions_and_enrollments),
+    path('courses/<int:course_id>/withdraw/', withdraw_from_course),
+    path('courses/<int:course_id>/rejoin/', rejoin_paid_course),
 
     path('auth/register/', RegisterView.as_view()),
     path('auth/token/', TokenObtainPairView.as_view()),

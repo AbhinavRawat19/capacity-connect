@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 import dj_database_url
+from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'dev-only-change-me')
 DEBUG = os.getenv('DJANGO_DEBUG', 'True').lower() == 'true'
 ALLOWED_HOSTS = [x.strip() for x in os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,backend').split(',') if x.strip()]
@@ -48,3 +50,11 @@ from datetime import timedelta
 SIMPLE_JWT = {'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60), 'REFRESH_TOKEN_LIFETIME': timedelta(days=7)}
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# PayPal marketplace (server-side credentials; never expose these to React)
+PAYPAL_CLIENT_ID = os.getenv('PAYPAL_CLIENT_ID', '')
+PAYPAL_CLIENT_SECRET = os.getenv('PAYPAL_CLIENT_SECRET', '')
+PAYPAL_BASE_URL = os.getenv('PAYPAL_BASE_URL', 'https://api-m.sandbox.paypal.com')
+PLATFORM_FEE_PERCENT = os.getenv('PLATFORM_FEE_PERCENT', '1')
+
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')

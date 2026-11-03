@@ -8,6 +8,7 @@ class User(AbstractUser):
     bio = models.TextField(blank=True)
     is_approved = models.BooleanField(default=False)
     competencies = models.JSONField(default=list, blank=True)
+    paypal_email = models.EmailField(blank=True)
     def save(self, *args, **kwargs):
         if self.is_superuser:
             self.role = 'admin'; self.is_approved = True
@@ -25,6 +26,8 @@ class Course(models.Model):
     trainer = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='courses')
     created_at = models.DateTimeField(auto_now_add=True)
     is_published = models.BooleanField(default=True)
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    currency = models.CharField(max_length=3, default='USD')
     def __str__(self): return self.title
 
 class Enrollment(models.Model):
@@ -168,3 +171,32 @@ class CourseDiscussion(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+
+class Payment(models.Model):
+    STATUS_CHOICES = [('created','Created'),('captured','Captured'),('failed','Failed'),('refunded','Refunded')]
+    learner = models.ForeignKey(User, on_delete=models.PROTECT, related_name='course_payments')
+    course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name='payments')
+    paypal_order_id = models.CharField(max_length=80, unique=True)
+    paypal_capture_id = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    gross_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    platform_fee = models.DecimalField(max_digits=10, decimal_places=2)
+    trainer_share = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class Payout(models.Model):
+    STATUS_CHOICES = [('pending','Pending'),('processing','Processing'),('completed','Completed'),('failed','Failed')]
+    trainer = models.ForeignKey(User, on_delete=models.PROTECT, related_name='course_payouts')
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+    paypal_batch_id = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)

@@ -21,13 +21,13 @@ class Command(BaseCommand):
             if changed: trainer.save()
 
         course_specs = [
-            {'title':'Python Programming: Zero to One','category':'Programming','level':'beginner','duration_hours':6,'description':'Learn variables, data types, conditionals, loops, functions, and lists through practical examples.','competencies':['Python','Programming fundamentals']},
-            {'title':'Cybersecurity Fundamentals','category':'Cybersecurity','level':'beginner','duration_hours':4,'description':'Explore the CIA triad, common threats, authentication, safe networking, and basic security hygiene.','competencies':['Cybersecurity','Networking','Security basics']},
-            {'title':'SQL and Database Essentials','category':'Database','level':'beginner','duration_hours':5,'description':'Practice relational database concepts, SELECT queries, filtering, sorting, and joins.','competencies':['SQL','Databases']},
+            {'title':'Python Programming: Zero to One','category':'Programming','level':'beginner','duration_hours':6,'description':'Learn variables, data types, conditionals, loops, functions, and lists through practical examples.','competencies':['Python','Programming fundamentals'],'price':'19.99','currency':'USD'},
+            {'title':'Cybersecurity Fundamentals','category':'Cybersecurity','level':'beginner','duration_hours':4,'description':'Explore the CIA triad, common threats, authentication, safe networking, and basic security hygiene.','competencies':['Cybersecurity','Networking','Security basics'],'price':'29.99','currency':'USD'},
+            {'title':'SQL and Database Essentials','category':'Database','level':'beginner','duration_hours':5,'description':'Practice relational database concepts, SELECT queries, filtering, sorting, and joins.','competencies':['SQL','Databases'],'price':'0.00','currency':'USD'},
         ]
         courses=[]
         for spec in course_specs:
-            course, _ = Course.objects.get_or_create(title=spec['title'], defaults={**spec,'trainer':trainer,'is_published':True})
+            course, _ = Course.objects.update_or_create(title=spec['title'], defaults={**spec,'trainer':trainer,'is_published':True})
             courses.append(course)
 
         lesson_specs = [

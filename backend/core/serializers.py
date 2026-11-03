@@ -1,10 +1,41 @@
 from rest_framework import serializers
-from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission, CourseLesson, Assignment, AssignmentSubmission, CourseDiscussion
+from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission, CourseLesson, Assignment, AssignmentSubmission, CourseDiscussion, Payment
 
 class UserSerializer(serializers.ModelSerializer):
+    paypal_email = serializers.EmailField(required=False, allow_blank=True)
+
+    def validate_competencies(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Competencies must be a list.')
+        for index, item in enumerate(value):
+            if isinstance(item, str):
+                if not item.strip():
+                    raise serializers.ValidationError({index: 'Skill names cannot be empty.'})
+                continue
+            if not isinstance(item, dict):
+                raise serializers.ValidationError({index: 'Each competency must be a skill name or an object.'})
+            name = item.get('name') or item.get('skill_name') or item.get('title')
+            if not isinstance(name, str) or not name.strip():
+                raise serializers.ValidationError({index: 'Each competency object must include a skill name.'})
+            if 'current_score' in item:
+                try:
+                    score = float(item['current_score'])
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError({index: 'current_score must be a number between 0 and 100.'})
+                if not 0 <= score <= 100:
+                    raise serializers.ValidationError({index: 'current_score must be between 0 and 100.'})
+        return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not (user and user.is_authenticated and (user.id == instance.id or user.is_superuser or getattr(user, 'role', '') == 'admin')):
+            data['paypal_email'] = ''
+        return data
     class Meta:
         model = User
-        fields = ['id','username','first_name','last_name','email','role','department','bio','is_approved','competencies','date_joined']
+        fields = ['id','username','first_name','last_name','email','role','department','bio','is_approved','competencies','paypal_email','date_joined']
         read_only_fields = ['id','is_approved','date_joined']
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
@@ -22,15 +53,28 @@ class RegisterSerializer(serializers.ModelSerializer):
 class CourseSerializer(serializers.ModelSerializer):
     trainer_name = serializers.SerializerMethodField()
     enrolled = serializers.SerializerMethodField()
+    previously_paid = serializers.SerializerMethodField()
     enrollment_count = serializers.IntegerField(read_only=True)
     class Meta:
         model = Course
-        fields = ['id','title','description','category','level','duration_hours','competencies','resource_url','trainer','trainer_name','created_at','is_published','enrolled','enrollment_count']
+        fields = ['id','title','description','category','level','duration_hours','competencies','resource_url','trainer','trainer_name','created_at','is_published','enrolled','previously_paid','enrollment_count','price','currency']
         read_only_fields = ['trainer','created_at','trainer_name','enrolled','enrollment_count']
+    def validate_price(self, value):
+        if value < 0: raise serializers.ValidationError('Price cannot be negative.')
+        return value
+    def validate_currency(self, value):
+        value = value.upper()
+        if value != 'USD': raise serializers.ValidationError('Only USD is supported in this prototype.')
+        return value
     def get_trainer_name(self,obj): return obj.trainer.get_full_name() or obj.trainer.username if obj.trainer else 'Unassigned'
     def get_enrolled(self,obj):
         user = self.context['request'].user
         return obj.enrollments.filter(trainee=user).exists() if user.is_authenticated else False
+    def get_previously_paid(self,obj):
+        user = self.context['request'].user
+        if not user.is_authenticated or getattr(user, 'role', '') != 'trainee':
+            return False
+        return Payment.objects.filter(learner=user, course=obj, status='captured').exists()
 class EnrollmentSerializer(serializers.ModelSerializer):
     course_title = serializers.CharField(source='course.title', read_only=True)
     course = CourseSerializer(read_only=True)
@@ -153,10 +197,30 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
         return attrs
 
 class CourseDiscussionSerializer(serializers.ModelSerializer):
+
     author_name = serializers.SerializerMethodField()
     author_role = serializers.CharField(source='author.role', read_only=True)
+
     class Meta:
         model = CourseDiscussion
-        fields = ['id','course','author','author_name','author_role','body','created_at','updated_at']
-        read_only_fields = ['id','author','author_name','author_role','created_at','updated_at']
-    def get_author_name(self,obj): return obj.author.get_full_name() or obj.author.username
+        fields = [
+            'id',
+            'course',
+            'author',
+            'author_name',
+            'author_role',
+            'body',
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = [
+            'id',
+            'author',
+            'author_name',
+            'author_role',
+            'created_at',
+            'updated_at'
+        ]
+
+    def get_author_name(self, obj):
+        return obj.author.get_full_name() or obj.author.username
