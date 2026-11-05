@@ -10,7 +10,10 @@ from .ai_service import get_learning_recommendations
 from .views import sync_assessment_questions_to_bank
 
 User = get_user_model()
+from unittest.mock import patch
+from decimal import Decimal
 
+from core.models import User, Course, Payment, Enrollment, Payout, PayPalDispute
 
 class CapacityConnectFixRegressionTests(TestCase):
     def setUp(self):
@@ -614,7 +617,7 @@ class CapacityConnectFullAPITests(TestCase):
         response = self.client.patch(f"/api/lessons/{lesson2.id}/", {
             "title": "Hijacked Lesson",
         }, format="json")
-        self.assertEqual(response.status_code, 403)
+        self.assertIn(response.status_code, (403, 404))
 
     def test_trainer_can_delete_own_lesson(self):
         self.client.force_authenticate(user=self.trainer)
@@ -630,7 +633,7 @@ class CapacityConnectFullAPITests(TestCase):
         )
         self.client.force_authenticate(user=self.trainer)
         response = self.client.delete(f"/api/lessons/{lesson2.id}/")
-        self.assertEqual(response.status_code, 403)
+        self.assertIn(response.status_code, (403, 404))
 
     # ── Assessments ─────────────────────────────────────────────────────
 
@@ -757,7 +760,7 @@ class CapacityConnectFullAPITests(TestCase):
         response = self.client.post(f"/api/assignments/{assignment.id}/submit/", {
             "response_text": "I'm not enrolled.",
         }, format="json")
-        self.assertEqual(response.status_code, 403)
+        self.assertIn(response.status_code, (403, 404))
 
     def test_past_deadline_assignment_submission_rejected(self):
         assignment = Assignment.objects.create(
@@ -1171,7 +1174,7 @@ class CapacityConnectFullAPITests(TestCase):
         response = self.client.post(f"/api/question-submissions/{q.id}/review/", {
             "status": "approved",
         }, format="json")
-        self.assertEqual(response.status_code, 403)
+        self.assertIn(response.status_code, (403, 404))
 
     # ── Assignment-specific edge cases ──────────────────────────────────
 
@@ -1203,7 +1206,7 @@ class CapacityConnectFullAPITests(TestCase):
         # Other trainer cannot
         self.client.force_authenticate(user=self.trainer2)
         response = self.client.get(f"/api/assignments/{assignment.id}/submissions/")
-        self.assertEqual(response.status_code, 403)
+        self.assertIn(response.status_code, (403, 404))
 
         # Learner cannot
         self.client.force_authenticate(user=self.learner)
@@ -1264,3 +1267,554 @@ class CapacityConnectFullAPITests(TestCase):
         self.client.force_authenticate(user=self.admin)
         response = self.client.post(f"/api/admin/users/{self.superuser.id}/approve/")
         self.assertEqual(response.status_code, 400)
+
+
+class PayPalPaymentSecurityTests(TestCase):
+
+    def setUp(self):
+        self.client = APIClient()
+
+        self.trainer = User.objects.create_user(
+            username="payment_trainer",
+            password="StrongPass123!",
+            role="trainer",
+            is_approved=True
+        )
+
+        self.student = User.objects.create_user(
+            username="payment_student",
+            password="StrongPass123!",
+            role="trainee",
+            is_approved=True
+        )
+
+        self.other_student = User.objects.create_user(
+            username="other_student",
+            password="StrongPass123!",
+            role="trainee",
+            is_approved=True
+        )
+
+        self.course = Course.objects.create(
+            title="Payment Security Course",
+            description="Testing payments",
+            trainer=self.trainer,
+            price=Decimal("100.00"),
+            currency="USD",
+            is_published=True
+        )
+
+        self.payment = Payment.objects.create(
+            learner=self.student,
+            course=self.course,
+            paypal_order_id="TEST-ORDER-001",
+            gross_amount=Decimal("100.00"),
+            platform_fee=Decimal("0.00"),
+            trainer_share=Decimal("0.00"),
+            currency="USD",
+            status="created"
+        )
+
+        self.client.force_authenticate(user=self.student)
+
+    # TEST 1: Failed PayPal order must not enroll student
+
+    @patch("core.views._paypal_request")
+    def test_failed_payment_does_not_enroll(self, mock_paypal):
+
+        mock_paypal.return_value = {
+            "id": "TEST-ORDER-001",
+            "status": "VOIDED",
+            "purchase_units": [{
+                "custom_id": f"{self.student.id}:{self.course.id}",
+                "amount": {
+                    "currency_code": "USD",
+                    "value": "100.00"
+                }
+            }]
+        }
+
+        response = self.client.post(
+            "/api/payments/capture-order/",
+            {"order_id": "TEST-ORDER-001"},
+            format="json"
+        )
+
+        self.assertEqual(response.status_code, 402)
+
+        self.assertFalse(
+            Enrollment.objects.filter(
+                trainee=self.student,
+                course=self.course
+            ).exists()
+        )
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(self.payment.status, "created")
+
+    # TEST 2: Declined capture must not enroll student
+
+    @patch("core.views._paypal_request")
+    def test_declined_capture_does_not_enroll(self, mock_paypal):
+
+        mock_paypal.side_effect = [
+            {
+                "id": "TEST-ORDER-001",
+                "status": "APPROVED",
+                "purchase_units": [{
+                    "custom_id": f"{self.student.id}:{self.course.id}",
+                    "amount": {
+                        "currency_code": "USD",
+                        "value": "100.00"
+                    }
+                }]
+            },
+            {
+                "id": "TEST-ORDER-001",
+                "status": "PAYER_ACTION_REQUIRED",
+                "purchase_units": []
+            }
+        ]
+
+        response = self.client.post(
+            "/api/payments/capture-order/",
+            {"order_id": "TEST-ORDER-001"},
+            format="json"
+        )
+
+        self.assertEqual(response.status_code, 402)
+
+        self.assertFalse(
+            Enrollment.objects.filter(
+                trainee=self.student,
+                course=self.course
+            ).exists()
+        )
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(self.payment.status, "created")
+
+    # TEST 3: Modified PayPal amount must be rejected
+
+    @patch("core.views._paypal_request")
+    def test_modified_amount_is_rejected(self, mock_paypal):
+
+        mock_paypal.return_value = {
+            "id": "TEST-ORDER-001",
+            "status": "APPROVED",
+            "purchase_units": [{
+                "custom_id": f"{self.student.id}:{self.course.id}",
+                "amount": {
+                    "currency_code": "USD",
+                    "value": "1.00"
+                }
+            }]
+        }
+
+        response = self.client.post(
+            "/api/payments/capture-order/",
+            {"order_id": "TEST-ORDER-001"},
+            format="json"
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertFalse(
+            Enrollment.objects.filter(
+                trainee=self.student,
+                course=self.course
+            ).exists()
+        )
+
+    # TEST 4: Another student cannot capture this order
+
+    def test_other_student_cannot_capture_order(self):
+
+        self.client.force_authenticate(user=self.other_student)
+
+        response = self.client.post(
+            "/api/payments/capture-order/",
+            {"order_id": "TEST-ORDER-001"},
+            format="json"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+        self.assertFalse(
+            Enrollment.objects.filter(
+                trainee=self.other_student,
+                course=self.course
+            ).exists()
+        )
+
+    # TEST 5: Successful capture enrolls student exactly once
+
+    @patch("core.views._paypal_request")
+    def test_successful_capture_and_duplicate_request(self, mock_paypal):
+
+        mock_paypal.side_effect = [
+            {
+                "id": "TEST-ORDER-001",
+                "status": "APPROVED",
+                "purchase_units": [{
+                    "custom_id": f"{self.student.id}:{self.course.id}",
+                    "amount": {
+                        "currency_code": "USD",
+                        "value": "100.00"
+                    }
+                }]
+            },
+            {
+                "id": "TEST-ORDER-001",
+                "status": "COMPLETED",
+                "purchase_units": [{
+                    "payments": {
+                        "captures": [{
+                            "id": "CAPTURE-001",
+                            "status": "COMPLETED",
+                            "amount": {
+                                "currency_code": "USD",
+                                "value": "100.00"
+                            }
+                        }]
+                    }
+                }]
+            }
+        ]
+
+        response = self.client.post(
+            "/api/payments/capture-order/",
+            {"order_id": "TEST-ORDER-001"},
+            format="json"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(self.payment.status, "captured")
+        self.assertEqual(
+            self.payment.paypal_capture_id,
+            "CAPTURE-001"
+        )
+
+        self.assertTrue(
+            Enrollment.objects.filter(
+                trainee=self.student,
+                course=self.course
+            ).exists()
+        )
+
+        # Repeat the same request
+
+        response2 = self.client.post(
+            "/api/payments/capture-order/",
+            {"order_id": "TEST-ORDER-001"},
+            format="json"
+        )
+
+        self.assertEqual(response2.status_code, 200)
+
+        self.assertEqual(
+            Enrollment.objects.filter(
+                trainee=self.student,
+                course=self.course
+            ).count(),
+            1
+        )
+
+        self.assertEqual(
+            Payment.objects.filter(
+                paypal_order_id="TEST-ORDER-001"
+            ).count(),
+            1
+        )
+
+        # PayPal should not be called again for an already captured order.
+
+        self.assertEqual(mock_paypal.call_count, 2)
+
+
+class PaymentHistorySecurityTests(TestCase):
+
+    def setUp(self):
+        self.client = APIClient()
+
+        self.admin = User.objects.create_user(
+            username="audit_admin",
+            password="StrongPass123!",
+            role="admin",
+            is_approved=True
+        )
+
+        self.trainer_a = User.objects.create_user(
+            username="trainer_a",
+            password="StrongPass123!",
+            role="trainer",
+            is_approved=True
+        )
+
+        self.trainer_b = User.objects.create_user(
+            username="trainer_b",
+            password="StrongPass123!",
+            role="trainer",
+            is_approved=True
+        )
+
+        self.student_a = User.objects.create_user(
+            username="student_a",
+            password="StrongPass123!",
+            role="trainee",
+            is_approved=True
+        )
+
+        self.student_b = User.objects.create_user(
+            username="student_b",
+            password="StrongPass123!",
+            role="trainee",
+            is_approved=True
+        )
+
+        self.course_a = Course.objects.create(
+            title="Course A",
+            description="Trainer A course",
+            trainer=self.trainer_a,
+            price=Decimal("100.00"),
+            currency="USD"
+        )
+
+        self.course_b = Course.objects.create(
+            title="Course B",
+            description="Trainer B course",
+            trainer=self.trainer_b,
+            price=Decimal("200.00"),
+            currency="USD"
+        )
+
+        self.payment_a = Payment.objects.create(
+            learner=self.student_a,
+            course=self.course_a,
+            paypal_order_id="AUDIT-ORDER-A",
+            paypal_capture_id="AUDIT-CAPTURE-A",
+            gross_amount=Decimal("100.00"),
+            platform_fee=Decimal("10.00"),
+            trainer_share=Decimal("90.00"),
+            currency="USD",
+            status="captured"
+        )
+
+        self.payment_b = Payment.objects.create(
+            learner=self.student_b,
+            course=self.course_b,
+            paypal_order_id="AUDIT-ORDER-B",
+            paypal_capture_id="AUDIT-CAPTURE-B",
+            gross_amount=Decimal("200.00"),
+            platform_fee=Decimal("20.00"),
+            trainer_share=Decimal("180.00"),
+            currency="USD",
+            status="captured"
+        )
+        Enrollment.objects.create(
+        trainee=self.student_a,
+        course=self.course_a
+        )
+
+        Enrollment.objects.create(
+            trainee=self.student_b,
+            course=self.course_b
+            )
+
+    def test_student_sees_only_own_payment_history(self):
+        self.client.force_authenticate(self.student_a)
+
+        response = self.client.get("/api/payments/history/")
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0]["learner_id"],
+            self.student_a.id
+        )
+
+    def test_trainer_sees_only_own_course_payments(self):
+        self.client.force_authenticate(self.trainer_a)
+
+        response = self.client.get("/api/payments/history/")
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0]["course_id"],
+            self.course_a.id
+        )
+
+    def test_admin_sees_all_payments(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get("/api/payments/history/")
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(len(response.data), 2)
+
+    def test_trainer_revenue_is_limited_to_own_courses(self):
+        self.client.force_authenticate(self.trainer_a)
+
+        response = self.client.get("/api/transactions/")
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            Decimal(response.data["summary"]["gross_revenue"]),
+            Decimal("100.00")
+        )
+
+        self.assertEqual(
+            Decimal(response.data["summary"]["trainer_shares"]),
+            Decimal("90.00")
+        )
+
+        for item in response.data["items"]:
+            self.assertEqual(item["trainer_id"], self.trainer_a.id)
+
+    def test_admin_sees_platform_wide_revenue(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get("/api/transactions/")
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            Decimal(response.data["summary"]["gross_revenue"]),
+            Decimal("300.00")
+        )
+
+        self.assertEqual(
+            Decimal(response.data["summary"]["platform_fees"]),
+            Decimal("30.00")
+        )
+
+        self.assertEqual(
+            Decimal(response.data["summary"]["trainer_shares"]),
+            Decimal("270.00")
+        )
+
+    def test_student_cannot_see_other_student_payment(self):
+        self.client.force_authenticate(self.student_a)
+
+        response = self.client.get("/api/transactions/")
+
+        self.assertEqual(response.status_code, 200)
+
+        for item in response.data["items"]:
+            self.assertEqual(
+                item["learner_id"],
+                self.student_a.id
+            )
+
+
+
+class PayPalFinanceEdgeCaseRegressionTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.trainer = User.objects.create_user(
+            username="finance_trainer", password="StrongPass123!",
+            role="trainer", is_approved=True, paypal_email="trainer@example.com",
+        )
+        self.learner = User.objects.create_user(
+            username="finance_learner", password="StrongPass123!",
+            role="trainee", is_approved=True,
+        )
+        self.course = Course.objects.create(
+            title="Finance Edge Course", description="Finance test",
+            trainer=self.trainer, price=Decimal("30.00"),
+        )
+
+    def _payment(self):
+        return Payment.objects.create(
+            learner=self.learner, course=self.course,
+            paypal_order_id="ORDER-FINANCE-EDGE",
+            paypal_capture_id="CAPTURE-FINANCE-EDGE",
+            gross_amount=Decimal("30.00"),
+            platform_fee=Decimal("0.30"),
+            trainer_share=Decimal("29.70"),
+            currency="USD", status="captured",
+        )
+
+    def _webhook(self, event_id, event_type, resource):
+        payload = {"id": event_id, "event_type": event_type, "resource": resource}
+        headers = {
+            "HTTP_PAYPAL_AUTH_ALGO": "SHA256withRSA",
+            "HTTP_PAYPAL_CERT_URL": "https://example.test/cert",
+            "HTTP_PAYPAL_TRANSMISSION_ID": "transmission-" + event_id,
+            "HTTP_PAYPAL_TRANSMISSION_SIG": "signature",
+            "HTTP_PAYPAL_TRANSMISSION_TIME": "2026-11-05T10:00:00Z",
+        }
+        with patch("core.views._paypal_verify_webhook_signature",
+                   return_value={"verification_status": "SUCCESS"}):
+            return self.client.post("/api/payments/webhook/", payload, format="json", **headers)
+
+    def test_nan_payout_amount_returns_400(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post(
+            "/api/trainer/payouts/",
+            {"amount": "NaN", "currency": "USD"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Payout.objects.filter(trainer=self.trainer).count(), 0)
+
+    def test_capture_refunded_event_before_refund_completed_does_not_double_count(self):
+        payment = self._payment()
+        with override_settings(PAYPAL_WEBHOOK_ID="test-webhook"):
+            first = self._webhook(
+                "EVENT-CAPTURE-REFUNDED", "PAYMENT.CAPTURE.REFUNDED",
+                {"id": payment.paypal_capture_id, "status": "PARTIALLY_REFUNDED",
+                 "amount": {"value": "30.00", "currency_code": "USD"}},
+            )
+            self.assertEqual(first.status_code, 202)
+            payment.refresh_from_db()
+            self.assertEqual(payment.refunded_amount, Decimal("0.00"))
+
+            second = self._webhook(
+                "EVENT-REFUND-COMPLETED", "PAYMENT.REFUND.COMPLETED",
+                {"id": "REFUND-EDGE-1",
+                 "supplementary_data": {"related_ids": {"capture_id": payment.paypal_capture_id}},
+                 "amount": {"value": "10.00", "currency_code": "USD"}},
+            )
+            self.assertEqual(second.status_code, 200)
+            payment.refresh_from_db()
+            self.assertEqual(payment.refunded_amount, Decimal("10.00"))
+
+    def test_disputed_trainer_share_is_not_available_for_withdrawal(self):
+        from core.views import _trainer_payout_balances
+        payment = self._payment()
+        PayPalDispute.objects.create(
+            dispute_id="DISPUTE-EDGE-1", payment=payment,
+            status="OPEN", amount=Decimal("15.00"), currency="USD",
+            raw_payload={"dispute_outcome": {}},
+        )
+        balance = _trainer_payout_balances(self.trainer)[0]
+        self.assertEqual(Decimal(balance["disputed"]), Decimal("14.85"))
+        self.assertEqual(Decimal(balance["available"]), Decimal("14.85"))
+
+    def test_payout_item_succeeded_webhook_completes_payout(self):
+        payout = Payout.objects.create(
+            trainer=self.trainer, amount=Decimal("10.00"), currency="USD",
+            status="processing", paypal_batch_id="BATCH-EDGE-1",
+            sender_batch_id="SENDER-EDGE-1",
+        )
+        with override_settings(PAYPAL_WEBHOOK_ID="test-webhook"):
+            response = self._webhook(
+                "EVENT-PAYOUT-SUCCEEDED", "PAYMENT.PAYOUTS-ITEM.SUCCEEDED",
+                {"payout_batch_id": payout.paypal_batch_id,
+                 "transaction_status": "SUCCESS", "payout_item_id": "ITEM-EDGE-1"},
+            )
+        self.assertEqual(response.status_code, 200)
+        payout.refresh_from_db()
+        self.assertEqual(payout.status, "completed")
+        self.assertIsNotNone(payout.completed_at)

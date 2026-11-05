@@ -1,4 +1,6 @@
 from rest_framework import serializers
+from django.db.models import Sum
+from decimal import Decimal
 from .models import User, Course, Enrollment, Assessment, Attempt, QuestionSubmission, CourseLesson, Assignment, AssignmentSubmission, CourseDiscussion, Payment
 
 class UserSerializer(serializers.ModelSerializer):
@@ -54,10 +56,11 @@ class CourseSerializer(serializers.ModelSerializer):
     trainer_name = serializers.SerializerMethodField()
     enrolled = serializers.SerializerMethodField()
     previously_paid = serializers.SerializerMethodField()
+    repayment_due = serializers.SerializerMethodField()
     enrollment_count = serializers.IntegerField(read_only=True)
     class Meta:
         model = Course
-        fields = ['id','title','description','category','level','duration_hours','competencies','resource_url','trainer','trainer_name','created_at','is_published','enrolled','previously_paid','enrollment_count','price','currency']
+        fields = ['id','title','description','category','level','duration_hours','competencies','resource_url','trainer','trainer_name','created_at','is_published','enrolled','previously_paid','repayment_due','enrollment_count','price','currency']
         read_only_fields = ['trainer','created_at','trainer_name','enrolled','enrollment_count']
     def validate_price(self, value):
         if value < 0: raise serializers.ValidationError('Price cannot be negative.')
@@ -74,7 +77,23 @@ class CourseSerializer(serializers.ModelSerializer):
         user = self.context['request'].user
         if not user.is_authenticated or getattr(user, 'role', '') != 'trainee':
             return False
-        return Payment.objects.filter(learner=user, course=obj, status='captured').exists()
+        return Payment.objects.filter(learner=user, course=obj, status__in=('captured', 'refunded')).exists()
+    def get_repayment_due(self, obj):
+        user = self.context['request'].user
+        if not user.is_authenticated or getattr(user, 'role', '') != 'trainee':
+            return '0.00'
+        source = Payment.objects.filter(
+            learner=user, course=obj, payment_type='purchase',
+            status__in=('captured', 'refunded'),
+        ).order_by('-captured_at', '-created_at', '-pk').first()
+        if not source:
+            return '0.00'
+        repayments = Payment.objects.filter(
+            learner=user, course=obj, payment_type='reinstatement',
+            source_payment=source, status__in=('captured', 'refunded'),
+        ).aggregate(total=Sum('gross_amount') - Sum('refunded_amount'))['total'] or Decimal('0.00')
+        due = max(Decimal(str(source.refunded_amount)) - Decimal(str(repayments)), Decimal('0.00'))
+        return str(due.quantize(Decimal('0.01')))
 class EnrollmentSerializer(serializers.ModelSerializer):
     course_title = serializers.CharField(source='course.title', read_only=True)
     course = CourseSerializer(read_only=True)

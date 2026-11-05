@@ -175,6 +175,7 @@ class CourseDiscussion(models.Model):
 
 class Payment(models.Model):
     STATUS_CHOICES = [('created','Created'),('captured','Captured'),('failed','Failed'),('refunded','Refunded')]
+    PAYMENT_TYPE_CHOICES = [('purchase', 'Course purchase'), ('reinstatement', 'Refund repayment')]
     learner = models.ForeignKey(User, on_delete=models.PROTECT, related_name='course_payments')
     course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name='payments')
     paypal_order_id = models.CharField(max_length=80, unique=True)
@@ -183,20 +184,92 @@ class Payment(models.Model):
     platform_fee = models.DecimalField(max_digits=10, decimal_places=2)
     trainer_share = models.DecimalField(max_digits=10, decimal_places=2)
     currency = models.CharField(max_length=3, default='USD')
+    payment_type = models.CharField(max_length=16, choices=PAYMENT_TYPE_CHOICES, default='purchase')
+    source_payment = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='reinstatement_payments',
+        help_text='Original purchase whose refunded amount this reinstatement repays.',
+    )
     status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='created')
     created_at = models.DateTimeField(auto_now_add=True)
     captured_at = models.DateTimeField(null=True, blank=True)
+    refunded_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
     class Meta:
         ordering = ['-created_at']
 
 
 class Payout(models.Model):
-    STATUS_CHOICES = [('pending','Pending'),('processing','Processing'),('completed','Completed'),('failed','Failed')]
+    STATUS_CHOICES = [('pending','Pending approval'),('approved','Approved'),('processing','Processing'),('completed','Completed'),('rejected','Rejected'),('failed','Failed')]
     trainer = models.ForeignKey(User, on_delete=models.PROTECT, related_name='course_payouts')
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     currency = models.CharField(max_length=3, default='USD')
     paypal_batch_id = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    sender_batch_id = models.CharField(max_length=80, unique=True, null=True, blank=True)
     status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='pending')
+    rejection_reason = models.CharField(max_length=500, blank=True)
+    failure_reason = models.CharField(max_length=1000, blank=True)
+    processed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='processed_course_payouts')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+
+class PayPalWebhookEvent(models.Model):
+    """Idempotency and audit record for verified PayPal webhook deliveries."""
+    event_id = models.CharField(max_length=120, unique=True)
+    event_type = models.CharField(max_length=120)
+    resource_id = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=32, default='processed')
+    payload = models.JSONField(default=dict)
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-received_at']
+
+
+class Refund(models.Model):
+    STATUS_CHOICES = [('pending', 'Pending'), ('completed', 'Completed'), ('failed', 'Failed')]
+    payment = models.ForeignKey(Payment, on_delete=models.PROTECT, related_name='refunds')
+    paypal_refund_id = models.CharField(max_length=120, unique=True, null=True, blank=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='pending')
+    reason = models.CharField(max_length=500, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='initiated_refunds')
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class PayPalDispute(models.Model):
+    """PayPal seller dispute/chargeback record synchronized from verified webhooks."""
+    dispute_id = models.CharField(max_length=120, unique=True)
+    payment = models.ForeignKey(Payment, on_delete=models.SET_NULL, null=True, blank=True, related_name='disputes')
+    status = models.CharField(max_length=40, blank=True)
+    reason = models.CharField(max_length=120, blank=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=3, blank=True)
+    evidence_due_date = models.DateTimeField(null=True, blank=True)
+    raw_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+
+class WithdrawnEnrollment(models.Model):
+    """Progress saved when a learner withdraws, so rejoining a paid course restores it."""
+    trainee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='withdrawn_enrollments')
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='withdrawn_enrollments')
+    progress = models.PositiveSmallIntegerField(default=0)
+    completed = models.BooleanField(default=False)
+    withdrawn_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['trainee', 'course'], name='unique_withdrawn_enrollment')]
