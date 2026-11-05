@@ -1,35 +1,56 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-capacity_connect}
       POSTGRES_USER: ${POSTGRES_USER:-capacity_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-capacity_user} -d ${POSTGRES_DB:-capacity_connect}"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
+
   backend:
     build: ./backend
+    restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-capacity_user}:${POSTGRES_PASSWORD:-change-this-password}@db:5432/${POSTGRES_DB:-capacity_connect}
-    ports: ["8000:8000"]
+      DATABASE_URL: postgres://${POSTGRES_USER:-capacity_user}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-capacity_connect}
+    expose:
+      - "8000"
     volumes:
       - uploaded_media:/app/media
+      - collected_static:/app/staticfiles
     depends_on:
       db:
         condition: service_healthy
-    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz/', timeout=4)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   frontend:
-    build: ./frontend
-    environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api}
-    ports: ["5173:5173"]
-    depends_on: [backend]
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /api
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    volumes:
+      - uploaded_media:/var/www/media:ro
+      - collected_static:/var/www/static:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   uploaded_media:
+  collected_static:
