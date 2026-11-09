@@ -1,5 +1,5 @@
 """Request/response contracts for Capacity Connect Learning Intelligence."""
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
@@ -11,6 +11,11 @@ class SkillInput(BaseModel):
     category: Optional[str] = None
     current_score: float = Field(ge=0, le=100)
     target_score: float = Field(ge=0, le=100)
+    # False when the learner only listed the skill name (no proficiency score was
+    # recorded), so current_score is an assumed 0 rather than a measurement.
+    scored: bool = True
+    # Optional human-readable note about where current_score came from.
+    evidence: Optional[str] = None
 
 
 class CourseInput(BaseModel):
@@ -29,6 +34,21 @@ class CourseInput(BaseModel):
     target_skills: List[str] = Field(default_factory=list)
     target_skill_ids: List[str] = Field(default_factory=list)
     prerequisites: List[str] = Field(default_factory=list)
+    # True when `prerequisites` were inferred from the level ladder inside a
+    # category rather than declared by the trainer; such prerequisites can be
+    # waived when the learner shows enough proficiency in the course's skills.
+    prerequisites_implied: bool = False
+
+
+class EnrollmentState(BaseModel):
+    """A learner's progress in one course (learning history)."""
+    model_config = ConfigDict(extra="ignore")
+
+    course_id: str = Field(min_length=1, max_length=120)
+    progress: int = Field(default=0, ge=0, le=100)
+    completed: bool = False
+    # Mean assessment percentage the learner achieved in this course, if any.
+    assessment_percent: Optional[float] = Field(default=None, ge=0, le=100)
 
 
 class LearningIntelligenceRequest(BaseModel):
@@ -38,6 +58,9 @@ class LearningIntelligenceRequest(BaseModel):
     skills: List[SkillInput] = Field(default_factory=list)
     courses: List[CourseInput] = Field(default_factory=list)
     completed_course_ids: List[str] = Field(default_factory=list)
+    # Optional richer history/profile signals; all default to "not provided".
+    enrollments: List[EnrollmentState] = Field(default_factory=list)
+    interests: List[str] = Field(default_factory=list)
     max_recommendations: int = Field(default=5, ge=1, le=20)
 
     @field_validator("skills")
@@ -78,6 +101,12 @@ class CourseRecommendation(BaseModel):
     duration: Optional[str] = None
     prerequisites: List[str] = Field(default_factory=list)
     unmet_prerequisites: List[str] = Field(default_factory=list)
+    # "recommended" | "continue" | "prerequisite_building" | "popular_fallback"
+    recommendation_type: str = "recommended"
+    # Titles of blocked courses this recommendation unlocks (prerequisite_building).
+    unlocks: List[str] = Field(default_factory=list)
+    # Per-component contribution to `score` (points out of 100), for transparency.
+    score_breakdown: Dict[str, float] = Field(default_factory=dict)
 
 
 class LearningPathStep(BaseModel):
@@ -98,3 +127,9 @@ class LearningIntelligenceResponse(BaseModel):
     learning_path: List[LearningPathStep]
     method: str
     notes: List[str] = Field(default_factory=list)
+    # "personalized" or "popularity" - which ranking path produced the list.
+    ranking_mode: str = "personalized"
+    # Assessment-backed adaptive competency and learning analytics.
+    competency_trends: List[Dict] = Field(default_factory=list)
+    learning_analytics: Dict = Field(default_factory=dict)
+    adaptive_scoring: Dict = Field(default_factory=dict)

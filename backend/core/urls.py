@@ -22,6 +22,11 @@ from .views import (
     review_assignment_submission,
     CourseDiscussionViewSet,
     learning_intelligence,
+    ai_generate_quiz,
+    ai_status,
+    tutor_conversations,
+    tutor_conversation_detail,
+    tutor_send_message,
     paypal_create_order,
     paypal_capture_order,
     payment_history,
@@ -51,6 +56,11 @@ router.register('discussions', CourseDiscussionViewSet, basename='discussion')
 
 urlpatterns = [
     path('ai/learning-intelligence/', learning_intelligence),
+    path('ai/status/', ai_status),
+    path('ai/quizzes/generate/', ai_generate_quiz),
+    path('ai/tutor/conversations/', tutor_conversations),
+    path('ai/tutor/conversations/<int:conversation_id>/', tutor_conversation_detail),
+    path('ai/tutor/conversations/<int:conversation_id>/messages/', tutor_send_message),
     path('payments/create-order/', paypal_create_order),
     path('payments/capture-order/', paypal_capture_order),
     path('payments/history/', payment_history),

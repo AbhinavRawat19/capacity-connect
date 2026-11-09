@@ -273,3 +273,26 @@ class WithdrawnEnrollment(models.Model):
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=['trainee', 'course'], name='unique_withdrawn_enrollment')]
+
+
+class TutorConversation(models.Model):
+    """Private conversation thread owned by one learner."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='tutor_conversations')
+    course = models.ForeignKey(Course, on_delete=models.SET_NULL, null=True, blank=True, related_name='tutor_conversations')
+    title = models.CharField(max_length=180, default='New conversation')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+
+class TutorMessage(models.Model):
+    ROLE_CHOICES = [('user', 'User'), ('assistant', 'Assistant')]
+    conversation = models.ForeignKey(TutorConversation, on_delete=models.CASCADE, related_name='messages')
+    role = models.CharField(max_length=12, choices=ROLE_CHOICES)
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at', 'id']

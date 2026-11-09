@@ -62,6 +62,7 @@ REST_FRAMEWORK = {
  'DEFAULT_THROTTLE_RATES': {
      'anon': os.getenv('API_ANON_RATE', '100/hour'),
      'user': os.getenv('API_USER_RATE', '1200/hour'),
+     'ai': os.getenv('API_AI_RATE', '60/hour'),
  },
  'DEFAULT_RENDERER_CLASSES': (
      ('rest_framework.renderers.JSONRenderer', 'rest_framework.renderers.BrowsableAPIRenderer')

@@ -43,6 +43,84 @@ def _priority(gap: float) -> str:
     return "Mastered"
 
 
+# Course.level ladder used to infer prerequisites (the Course model has no
+# explicit prerequisite field).
+LEVEL_ORDER = {"beginner": 0, "intermediate": 1, "advanced": 2}
+
+# An *implied* (level-ladder) prerequisite is waived when the learner's average
+# score across the course's target skills they already track reaches this value.
+IMPLIED_PREREQUISITE_WAIVER_SCORE = 60.0
+
+
+def _level_rank(value: str | None) -> int | None:
+    return LEVEL_ORDER.get(_normalise(value))
+
+
+def _skill_keys(course) -> set[str]:
+    return {k for k in (_normalise(s) for s in course.target_skills) if k}
+
+
+def infer_level_prerequisites(courses: Sequence[CourseInput]) -> Sequence[CourseInput]:
+    """Derive implied prerequisites from the level ladder inside each category.
+
+    The Course model has no prerequisite field, so for every Intermediate or
+    Advanced course we look in the same category for the nearest lower level
+    that has at least one course sharing a target skill, and treat those courses
+    as prerequisites. Matching on a shared skill keeps unrelated courses in a
+    broad category (for example the default "General") from blocking each other.
+
+    Rules:
+    - Mutates and returns ``courses`` (CourseInput objects are updated in place).
+    - Prerequisites declared explicitly on a course are never overwritten.
+    - Courses with an unknown level, no target skills, or no qualifying
+      lower-level course are left untouched.
+    - Dependencies always point to a strictly lower level, so cycles are
+      impossible by construction.
+    - Inferred prerequisites set ``prerequisites_implied=True`` so the ranker can
+      waive them for learners who already show proficiency.
+    """
+    groups: dict[str, list[tuple[int, CourseInput]]] = {}
+    for course in courses:
+        rank = _level_rank(course.difficulty)
+        if rank is not None:
+            groups.setdefault(_normalise(course.category), []).append((rank, course))
+
+    for group in groups.values():
+        for rank, course in group:
+            if rank == 0 or course.prerequisites:
+                continue
+            skills = _skill_keys(course)
+            if not skills:
+                continue
+            for lower in range(rank - 1, -1, -1):
+                ids = sorted({
+                    other.id for other_rank, other in group
+                    if other_rank == lower and other.id != course.id and _skill_keys(other) & skills
+                })
+                if ids:
+                    course.prerequisites = ids
+                    course.prerequisites_implied = True
+                    break
+    return courses
+
+
+def _implied_prerequisites_waived(course: CourseInput, skills_by_key: dict) -> bool:
+    scores = []
+    for target in course.target_skills:
+        skill = skills_by_key.get(_normalise(target))
+        if skill is not None and skill.scored:
+            scores.append(skill.current_score)
+    return bool(scores) and sum(scores) / len(scores) >= IMPLIED_PREREQUISITE_WAIVER_SCORE
+
+
+def _unmet_prerequisites(course: CourseInput, completed: set, skills_by_key: dict) -> list[str]:
+    """Prerequisites still blocking ``course``; implied ones are waived for proficient learners."""
+    unmet = [p for p in course.prerequisites if p not in completed]
+    if unmet and course.prerequisites_implied and _implied_prerequisites_waived(course, skills_by_key):
+        return []
+    return unmet
+
+
 def _course_match(skill, course: CourseInput) -> tuple[float, str | None]:
     """Return a relevance score in [0, 1] and a human-readable match reason."""
     skill_name = _normalise(skill.name)
@@ -98,8 +176,16 @@ def _gap_results(request: LearningIntelligenceRequest) -> list[SkillGapResult]:
 
 def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult]) -> list[CourseRecommendation]:
     skill_by_name = {s.name.casefold(): s for s in request.skills}
+    skills_by_key = {_normalise(s.name): s for s in request.skills}
     completed = set(request.completed_course_ids)
     eligible_courses = [c for c in request.courses if c.id not in completed]
+    progress_by_course = {e.course_id: e.progress for e in request.enrollments}
+
+    def in_progress(course: CourseInput) -> bool:
+        return 0 < progress_by_course.get(course.id, 0) < 100
+
+    def unmet_for(course: CourseInput) -> list[str]:
+        return _unmet_prerequisites(course, completed, skills_by_key)
 
     def matches_for(course: CourseInput) -> list[tuple[float, SkillGapResult, str]]:
         matches = []
@@ -132,18 +218,21 @@ def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult])
             )
             if course.popularity_count == 0:
                 reason = "Recommended from the available published catalog; popularity data is not available yet."
-            unmet = [p for p in course.prerequisites if p not in completed]
+            reasons = [reason, "Popularity fallback is used because there is not enough skill-match data for reliable personalization."]
+            if in_progress(course):
+                reasons.insert(0, f"You are {progress_by_course[course.id]}% through this course.")
             results.append(CourseRecommendation(
                 course_id=course.id,
                 title=course.title,
                 score=score,
                 priority="Low",
                 matched_skills=[],
-                reasons=[reason, "Popularity fallback is used because there is not enough skill-match data for reliable personalization."],
+                reasons=reasons,
                 difficulty=course.difficulty,
                 duration=course.duration,
                 prerequisites=course.prerequisites,
-                unmet_prerequisites=unmet,
+                unmet_prerequisites=unmet_for(course),
+                recommendation_type="continue" if in_progress(course) else "popular_fallback",
             ))
         return results
 
@@ -161,7 +250,8 @@ def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult])
                          f"Enrollment popularity: {course.popularity_count} learner(s)."],
                 difficulty=course.difficulty, duration=course.duration,
                 prerequisites=course.prerequisites,
-                unmet_prerequisites=[p for p in course.prerequisites if p not in completed],
+                unmet_prerequisites=unmet_for(course),
+                recommendation_type="continue" if in_progress(course) else "recommended",
             ))
             continue
 
@@ -169,8 +259,28 @@ def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult])
         best_match, best_gap, best_reason = matches[0]
         additional_coverage = min(0.10, 0.025 * (len(matches) - 1))
         gap_weight = min(1.0, best_gap.gap / 50.0)
-        rating_weight = course.rating / 5.0
-        score = min(1.0, 0.65 * best_match + 0.25 * gap_weight + 0.10 * rating_weight + additional_coverage)
+        # rating == 0 means "no rating data" (the platform has no ratings yet):
+        # the rating component is then dropped and the remaining weights are
+        # renormalised instead of inventing a rating.
+        if course.rating > 0:
+            rating_points = 10.0 * course.rating / 5.0
+            raw_score = 0.65 * best_match + 0.25 * gap_weight + 0.10 * (course.rating / 5.0) + additional_coverage
+            breakdown = {
+                "skill_match": round(65.0 * best_match, 2),
+                "skill_gap": round(25.0 * gap_weight, 2),
+                "rating": round(rating_points, 2),
+                "additional_coverage": round(100.0 * additional_coverage, 2),
+            }
+        else:
+            raw_score = (0.65 * best_match + 0.25 * gap_weight) / 0.90 + additional_coverage
+            breakdown = {
+                "skill_match": round(65.0 / 0.90 * best_match, 2),
+                "skill_gap": round(25.0 / 0.90 * gap_weight, 2),
+                "additional_coverage": round(100.0 * additional_coverage, 2),
+            }
+        score = min(1.0, raw_score)
+        if raw_score > 1.0:
+            breakdown["cap_adjustment"] = round((score - raw_score) * 100.0, 2)
         reasons = [best_reason, f"{best_gap.priority} priority: {best_gap.skill_name} has a {best_gap.gap:g}-point gap."]
         if len(matches) > 1:
             covered = [m[1].skill_name for m in matches]
@@ -179,12 +289,15 @@ def _recommend(request: LearningIntelligenceRequest, gaps: list[SkillGapResult])
             reasons.append(f"Catalog rating: {course.rating:g}/5.")
         if course.popularity_count:
             reasons.append(f"Enrollment popularity: {course.popularity_count} learner(s).")
-        unmet = [p for p in course.prerequisites if p not in completed]
+        if in_progress(course):
+            reasons.insert(0, f"You are {progress_by_course[course.id]}% through this course.")
         candidates.append(CourseRecommendation(
             course_id=course.id, title=course.title, score=round(score * 100, 2),
             priority=best_gap.priority, matched_skills=[m[1].skill_name for m in matches],
             reasons=reasons, difficulty=course.difficulty, duration=course.duration,
-            prerequisites=course.prerequisites, unmet_prerequisites=unmet,
+            prerequisites=course.prerequisites, unmet_prerequisites=unmet_for(course),
+            recommendation_type="continue" if in_progress(course) else "recommended",
+            score_breakdown=breakdown,
         ))
 
     priority_order = {"High": 0, "Medium": 1, "Low": 2, "Mastered": 3}
@@ -200,10 +313,12 @@ def _build_learning_path(
     recommendations: Sequence[CourseRecommendation],
     courses: Sequence[CourseInput],
     completed_ids: Iterable[str],
+    skills: Iterable = (),
 ) -> list[LearningPathStep]:
     """Create a prerequisite-aware path, avoiding duplicates and dependency cycles."""
     catalog = {c.id: c for c in courses}
     completed = set(completed_ids)
+    skills_by_key = {_normalise(s.name): s for s in skills}
     by_recommendation = {r.course_id: r for r in recommendations}
     ordered_ids: list[str] = []
     visiting: set[str] = set()
@@ -219,7 +334,7 @@ def _build_learning_path(
         if course is None:
             return
         visiting.add(course_id)
-        for prerequisite_id in course.prerequisites:
+        for prerequisite_id in _unmet_prerequisites(course, completed, skills_by_key):
             if prerequisite_id not in completed:
                 visit(prerequisite_id, root_id)
                 if prerequisite_id in catalog and prerequisite_id not in completed:
@@ -252,7 +367,8 @@ def _build_learning_path(
 def build_learning_intelligence(request: LearningIntelligenceRequest) -> LearningIntelligenceResponse:
     gaps = _gap_results(request)
     recommendations = _recommend(request, gaps)
-    path = _build_learning_path(recommendations, request.courses, request.completed_course_ids)
+    path = _build_learning_path(recommendations, request.courses, request.completed_course_ids, request.skills)
+    popularity_only = bool(recommendations) and not any(rec.matched_skills for rec in recommendations)
 
     notes = [
         "Recommendations use an explainable, content-based scoring baseline; this is not a trained ML model.",
@@ -278,6 +394,7 @@ def build_learning_intelligence(request: LearningIntelligenceRequest) -> Learnin
         learning_path=path,
         method="explainable_content_based_baseline",
         notes=notes,
+        ranking_mode="popularity" if popularity_only else "personalized",
     )
 
 

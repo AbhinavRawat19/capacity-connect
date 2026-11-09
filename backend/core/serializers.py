@@ -114,8 +114,31 @@ class AssessmentSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             can_see_answers = request.user.is_superuser or request.user.role == 'admin' or (request.user.role == 'trainer' and instance.course.trainer_id == request.user.id)
             if not can_see_answers:
-                data['questions'] = [{k:v for k,v in q.items() if k != 'correct_answer'} for q in (instance.questions or [])]
+                # Learners must not receive the answer key, the explanation (which usually names the
+                # answer) or the question-bank link (which could be used to grade-practice the question).
+                hidden = {'correct_answer', 'explanation', 'question_bank_id'}
+                data['questions'] = [{k:v for k,v in q.items() if k not in hidden} for q in (instance.questions or []) if isinstance(q, dict)]
         return data
+    def validate_questions(self, value):
+        if not isinstance(value, list) or len(value) > 100:
+            raise serializers.ValidationError('Questions must be a list of at most 100 items.')
+        seen = set()
+        for index, q in enumerate(value, 1):
+            if not isinstance(q, dict):
+                raise serializers.ValidationError(f'Question {index} is malformed.')
+            if not str(q.get('text', '')).strip():
+                raise serializers.ValidationError(f'Question {index} needs question text.')
+            options = q.get('options')
+            if not isinstance(options, list) or not 2 <= len(options) <= 6 or any(not str(o).strip() for o in options):
+                raise serializers.ValidationError(f'Question {index} needs 2-6 non-empty options.')
+            answer = q.get('correct_answer')
+            if isinstance(answer, bool) or not isinstance(answer, int) or not 0 <= answer < len(options):
+                raise serializers.ValidationError(f'Question {index} needs a correct_answer index that matches one option.')
+            qid = str(q.get('id', index))
+            if qid in seen:
+                raise serializers.ValidationError(f'Question {index} reuses the ID {qid}.')
+            seen.add(qid)
+        return value
 class AttemptSerializer(serializers.ModelSerializer):
     assessment_title = serializers.CharField(source='assessment.title', read_only=True)
     course_title = serializers.CharField(source='assessment.course.title', read_only=True)

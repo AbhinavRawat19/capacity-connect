@@ -105,9 +105,19 @@ class Phase3FinancialManagementTests(TestCase):
 
     @override_settings(PAYPAL_WEBHOOK_ID='sandbox-webhook-id')
     @patch('core.views._paypal_verify_webhook_signature')
-    def test_capture_refunded_webhook_marks_payment_refunded_once(self, verify_signature):
+    def test_capture_refunded_webhook_defers_to_refund_level_event(self, verify_signature):
+        """A capture-level REFUNDED event carries no refund ID or exact amount, so it must
+        be acknowledged (HTTP 202, reconciliation_required) without inventing a refund.
+        The refund-level event then applies the money exactly once."""
         verify_signature.return_value = {'verification_status': 'SUCCESS'}
-        payload = {
+        headers = {
+            'HTTP_PAYPAL_AUTH_ALGO': 'SHA256withRSA',
+            'HTTP_PAYPAL_CERT_URL': 'https://api.paypal.com/cert',
+            'HTTP_PAYPAL_TRANSMISSION_ID': 'tx-capture-refunded-1',
+            'HTTP_PAYPAL_TRANSMISSION_SIG': 'valid-signature',
+            'HTTP_PAYPAL_TRANSMISSION_TIME': '2026-11-03T00:00:00Z',
+        }
+        capture_payload = {
             'id': 'EVT-CAPTURE-REFUNDED-001',
             'event_type': 'PAYMENT.CAPTURE.REFUNDED',
             'resource': {
@@ -116,22 +126,40 @@ class Phase3FinancialManagementTests(TestCase):
                 'amount': {'value': '100.00', 'currency_code': 'USD'},
             },
         }
-        headers = {
-            'HTTP_PAYPAL_AUTH_ALGO': 'SHA256withRSA',
-            'HTTP_PAYPAL_CERT_URL': 'https://api.paypal.com/cert',
-            'HTTP_PAYPAL_TRANSMISSION_ID': 'tx-capture-refunded-1',
-            'HTTP_PAYPAL_TRANSMISSION_SIG': 'valid-signature',
-            'HTTP_PAYPAL_TRANSMISSION_TIME': '2026-11-03T00:00:00Z',
-        }
-        first = self.client.post('/api/payments/webhook/', payload, format='json', **headers)
-        second = self.client.post('/api/payments/webhook/', payload, format='json', **headers)
-        self.assertEqual(first.status_code, 200)
+        first = self.client.post('/api/payments/webhook/', capture_payload, format='json', **headers)
+        self.assertEqual(first.status_code, 202)
+        self.assertTrue(first.data['reconciliation_required'])
+        # PayPal redelivery of the same event is an idempotent duplicate acknowledgement.
+        second = self.client.post('/api/payments/webhook/', capture_payload, format='json', **headers)
         self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.data['duplicate'])
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.refunded_amount, Decimal('0.00'))
+        self.assertEqual(self.payment.status, 'captured')
+        self.assertEqual(self.payment.refunds.count(), 0)
+        self.assertFalse(Enrollment.objects.filter(trainee=self.learner, course=self.course).exists())
+        self.assertEqual(
+            PayPalWebhookEvent.objects.get(event_id='EVT-CAPTURE-REFUNDED-001').status,
+            'reconciliation_required',
+        )
+
+        refund_payload = {
+            'id': 'EVT-REFUND-COMPLETED-001',
+            'event_type': 'PAYMENT.REFUND.COMPLETED',
+            'resource': {
+                'id': 'PHASE3-REFUND-FULL',
+                'supplementary_data': {'related_ids': {'capture_id': 'PHASE3-CAPTURE'}},
+                'amount': {'value': '100.00', 'currency_code': 'USD'},
+            },
+        }
+        refund_headers = dict(headers, HTTP_PAYPAL_TRANSMISSION_ID='tx-refund-completed-1')
+        for _ in range(2):  # second delivery must not double-count
+            response = self.client.post('/api/payments/webhook/', refund_payload, format='json', **refund_headers)
+            self.assertEqual(response.status_code, 200)
         self.payment.refresh_from_db()
         self.assertEqual(self.payment.refunded_amount, Decimal('100.00'))
         self.assertEqual(self.payment.status, 'refunded')
         self.assertEqual(self.payment.refunds.count(), 1)
-        self.assertFalse(Enrollment.objects.filter(trainee=self.learner, course=self.course).exists())
 
     @override_settings(PAYPAL_WEBHOOK_ID='sandbox-webhook-id')
     @patch('core.views._paypal_verify_webhook_signature')
