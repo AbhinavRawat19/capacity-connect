@@ -249,13 +249,15 @@ class Command(BaseCommand):
                 correct = index < correct_count
                 chosen = question.get("correct_answer", 0) if correct else (question.get("correct_answer", 0) + 1) % max(1, len(question.get("options", [])))
                 answers[str(question.get("id", index))] = chosen
-                results[str(question.get("id", index))] = {"correct": correct, "selected_answer": chosen}
-            Attempt.objects.get_or_create(
+                results[str(question.get("id", index))] = correct
+            Attempt.objects.update_or_create(
                 trainee=learners[username], assessment=assessment,
-                defaults={"answers": answers, "score": correct_count,
+                defaults={"answers": answers,
+                          "score": round(correct_count / len(questions) * 100, 2) if questions else 0,
                           "total_questions": len(questions), "question_timings": {},
-                          "question_results": results, "points": correct_count},
+                          "question_results": results, "points": correct_count * 10},
             )
+
 
         # Assignment submissions cover submitted, reviewed and revision-requested states.
         submission_plan = [
