@@ -113,7 +113,9 @@ class AssessmentSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             can_see_answers = request.user.is_superuser or request.user.role == 'admin' or (request.user.role == 'trainer' and instance.course.trainer_id == request.user.id)
-            if not can_see_answers:
+            # A learner who already submitted may see the correct answers (read-only review).
+            has_attempted = (not can_see_answers) and Attempt.objects.filter(trainee=request.user, assessment=instance).exists()
+            if not can_see_answers and not has_attempted:
                 data['questions'] = [{k:v for k,v in q.items() if k != 'correct_answer'} for q in (instance.questions or [])]
         return data
 class AttemptSerializer(serializers.ModelSerializer):

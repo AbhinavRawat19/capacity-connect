@@ -714,6 +714,22 @@ class CapacityConnectFullAPITests(TestCase):
         for q in response.data["questions"]:
             self.assertIn("correct_answer", q)
 
+    def test_learner_sees_correct_answers_only_after_submitting(self):
+        self.client.force_authenticate(user=self.learner)
+        self.client.post(f"/api/assessments/{self.assessment.id}/submit/", {
+            "answers": {"q1": 0, "q2": 0},
+        }, format="json")
+        response = self.client.get(f"/api/assessments/{self.assessment.id}/")
+        self.assertEqual(response.status_code, 200)
+        for q in response.data["questions"]:
+            self.assertIn("correct_answer", q)
+
+    def test_create_order_with_non_numeric_course_id_returns_404(self):
+        self.client.force_authenticate(user=self.learner)
+        for bad in ("abc", None, [], {}):
+            response = self.client.post("/api/payments/create-order/", {"course_id": bad}, format="json")
+            self.assertEqual(response.status_code, 404, bad)
+
     # ── Assignments ─────────────────────────────────────────────────────
 
     def test_trainer_creates_assignment(self):

@@ -182,7 +182,7 @@ def _platform_fee_percent():
 def paypal_create_order(request):
     try:
         course = Course.objects.select_for_update().get(pk=request.data.get('course_id'), is_published=True)
-    except Course.DoesNotExist:
+    except (Course.DoesNotExist, TypeError, ValueError):
         return Response({'detail':'Course not found.'}, status=404)
     if Enrollment.objects.filter(trainee=request.user, course=course).exists():
         return Response({'detail':'You are already enrolled.'}, status=409)
