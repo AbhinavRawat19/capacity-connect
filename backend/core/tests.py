@@ -724,6 +724,39 @@ class CapacityConnectFullAPITests(TestCase):
         for q in response.data["questions"]:
             self.assertIn("correct_answer", q)
 
+    def test_missed_quiz_question_can_be_practised_through_the_question_bank(self):
+        # Trainer creates a quiz through the API so each question is linked to a bank entry.
+        self.client.force_authenticate(user=self.trainer)
+        created = self.client.post("/api/assessments/", {
+            "course": self.course.id, "title": "Practice Quiz",
+            "questions": [
+                {"id": "a", "text": "Capital of France?", "options": ["Paris", "Rome", "Oslo", "Bern"], "correct_answer": 0, "explanation": "Paris."},
+                {"id": "b", "text": "2+2?", "options": ["3", "4", "5", "6"], "correct_answer": 1},
+            ],
+        }, format="json")
+        self.assertEqual(created.status_code, 201)
+        quiz_id = created.data["id"]
+
+        self.client.force_authenticate(user=self.learner)
+        Enrollment.objects.get_or_create(trainee=self.learner, course=self.course)
+        submit = self.client.post(f"/api/assessments/{quiz_id}/submit/", {"answers": {"a": 1, "b": 1}}, format="json")
+        self.assertEqual(submit.status_code, 201)
+
+        # The review data now carries the correct answer and the bank link for the missed question.
+        detail = self.client.get(f"/api/assessments/{quiz_id}/").data
+        missed = next(q for q in detail["questions"] if q["id"] == "a")
+        self.assertEqual(missed["correct_answer"], 0)
+        self.assertTrue(missed["question_bank_id"])
+
+        wrong = self.client.post("/api/question-submissions/grade-practice/", {"answers": {str(missed["question_bank_id"]): 1}}, format="json")
+        self.assertEqual(wrong.status_code, 200)
+        self.assertEqual(wrong.data["correct"], 0)
+        right = self.client.post("/api/question-submissions/grade-practice/", {"answers": {str(missed["question_bank_id"]): 0}}, format="json")
+        self.assertEqual(right.data["correct"], 1)
+        self.assertEqual(right.data["points_earned"], 10)
+        again = self.client.post("/api/question-submissions/grade-practice/", {"answers": {str(missed["question_bank_id"]): 0}}, format="json")
+        self.assertEqual(again.data["points_earned"], 0)  # no point farming
+
     def test_create_order_with_non_numeric_course_id_returns_404(self):
         self.client.force_authenticate(user=self.learner)
         for bad in ("abc", None, [], {}):

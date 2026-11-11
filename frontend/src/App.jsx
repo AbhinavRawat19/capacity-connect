@@ -3,6 +3,7 @@ import { Activity, Receipt, LoaderCircle, BookOpen, ClipboardCheck, ChartNoAxesC
 import { api, login, logout, getToken } from './api';
 import { CertificateCard, CertificateSheet, PrintableCertificate, verifyUrl } from './Certificate';
 import { AnalyticsView } from './Analytics';
+import { PracticeMissed, missedQuestions } from './PracticeMissed';
 const cx = (...a) => a.filter(Boolean).join(' ');
 const SKILL_CATALOG = ['Python', 'C', 'C++', 'Java', 'JavaScript', 'TypeScript', 'React', 'Node.js', 'Django', 'SQL', 'PostgreSQL', 'Data Structures & Algorithms', 'Cybersecurity', 'Ethical Hacking', 'Penetration Testing', 'Network Security', 'Linux', 'Kali Linux', 'Cloud Computing', 'AWS', 'Azure', 'DevOps', 'Git', 'Docker', 'Machine Learning', 'Artificial Intelligence', 'Data Science', 'Data Analytics', 'HTML', 'CSS', 'UI/UX Design', 'Communication', 'Leadership', 'Project Management', 'Problem Solving', 'Public Speaking', 'Excel', 'Power BI'];
 function Logo({ onClick }) { return <button type="button" onClick={onClick} aria-label="CAPACITY CONNECT home" className="flex items-center gap-3 text-left"><div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-lime-300 text-slate-950"><Layers3 size={22} /></div><div><div className="font-black tracking-wide text-white">CAPACITY<span className="text-lime-300">CONNECT</span></div><div className="text-[10px] uppercase tracking-[.2em] text-slate-500">Open learning community</div></div></button> }
@@ -20,6 +21,7 @@ function App() {
     const [transactionSearch, setTransactionSearch] = useState(''), [transactionStatus, setTransactionStatus] = useState('all'), [transactionCourse, setTransactionCourse] = useState('all'), [transactionSort, setTransactionSort] = useState('newest'), [transactionFrom, setTransactionFrom] = useState(''), [transactionTo, setTransactionTo] = useState('');
     const captureRequests = useRef(new Set());
     const [certificates, setCertificates] = useState([]), [certificatesLoading, setCertificatesLoading] = useState(false), [viewCertificate, setViewCertificate] = useState(null);
+    const [practice, setPractice] = useState(null);
     const [analytics, setAnalytics] = useState(null), [analyticsLoading, setAnalyticsLoading] = useState(false), [analyticsError, setAnalyticsError] = useState('');
     useEffect(() => {
         if (!notice && !error) return;
@@ -542,9 +544,10 @@ function App() {
                     </div>
                 })}
             </div>
-            <div className="mt-5 flex justify-end"><button className="btn btn-primary" onClick={() => setReviewing(null)}>Close</button></div>
+            {(() => { const missed = missedQuestions(reviewing.assessment, reviewing.attempt); return <div className="mt-5 flex flex-wrap justify-end gap-2">{missed.length > 0 && <button className="btn btn-secondary" onClick={() => { setPractice({ title: `Practice: ${reviewing.assessment.title}`, items: missed }); setReviewing(null) }}>Practice {missed.length} missed {missed.length === 1 ? 'question' : 'questions'}</button>}<button className="btn btn-primary" onClick={() => setReviewing(null)}>Close</button></div> })()}
         </Modal>}
 
+        {practice && <PracticeMissed title={practice.title} items={practice.items} onClose={() => setPractice(null)} onSubmitted={() => { api('/leaderboard/').then(setLeaderboard).catch(() => { }) }} />}
         {viewCertificate && <Modal title="Certificate of completion" onClose={() => setViewCertificate(null)}>
             <CertificateSheet cert={viewCertificate} />
             <PrintableCertificate cert={viewCertificate} />
