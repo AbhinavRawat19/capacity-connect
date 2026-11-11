@@ -39,6 +39,7 @@ from .views import (
     admin_sync_trainer_payout,
 )
 from .insights import my_certificates, verify_certificate, trainer_analytics
+from .achievements import my_achievements
 
 router = DefaultRouter()
 
@@ -67,6 +68,7 @@ urlpatterns = [
     path('certificates/', my_certificates),
     path('certificates/verify/<str:code>/', verify_certificate),
     path('trainer/analytics/', trainer_analytics),
+    path('achievements/', my_achievements),
     path('transactions/', transactions_and_enrollments),
     path('courses/<int:course_id>/withdraw/', withdraw_from_course),
     path('courses/<int:course_id>/rejoin/', rejoin_paid_course),
