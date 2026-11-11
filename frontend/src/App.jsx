@@ -520,7 +520,7 @@ function App() {
                             <span className={'shrink-0 text-xs font-bold ' + (ok ? 'text-lime-300' : 'text-rose-300')}>{ok ? 'Correct' : 'Incorrect'}</span>
                         </div>
                         <div className="mt-2 space-y-2">
-                            {q.options.map((op, j) => <div key={j} className={'rounded-lg border px-3 py-2 text-sm ' + (Number(chosen) === j ? (ok ? 'border-lime-300/50 bg-lime-300/10 text-lime-100' : 'border-rose-400/50 bg-rose-400/10 text-rose-100') : 'border-slate-800 text-slate-400')}>{op}{Number(chosen) === j ? '  ← your answer' : ''}</div>)}
+                            {q.options.map((op, j) => { const isCorrectOpt = q.correct_answer !== undefined && q.correct_answer !== null && Number(q.correct_answer) === j; return <div key={j} className={'rounded-lg border px-3 py-2 text-sm ' + (Number(chosen) === j ? (ok ? 'border-lime-300/50 bg-lime-300/10 text-lime-100' : 'border-rose-400/50 bg-rose-400/10 text-rose-100') : isCorrectOpt ? 'border-lime-300/50 text-lime-200' : 'border-slate-800 text-slate-400')}>{op}{Number(chosen) === j ? '  ← your answer' : ''}{isCorrectOpt && Number(chosen) !== j ? '  ✓ correct answer' : ''}</div> })}
                         </div>
                         {q.explanation && <p className="mt-3 text-sm text-slate-400"><span className="font-semibold text-slate-300">Why: </span>{q.explanation}</p>}
                     </div>

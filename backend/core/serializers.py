@@ -108,12 +108,41 @@ class AssessmentSerializer(serializers.ModelSerializer):
         fields = ['id','course','course_title','title','instructions','deadline','duration_minutes','questions','created_by','created_at','is_published','question_count']
         read_only_fields = ['created_by','created_at','question_count']
     def get_question_count(self,obj): return len(obj.questions or [])
+    def validate_questions(self, value):
+        # Questions are stored as JSON and graded server-side, so reject malformed shapes up front
+        # (otherwise a bad quiz can 500 or become impossible to answer correctly).
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Questions must be a list.')
+        seen_ids = set()
+        cleaned = []
+        for i, q in enumerate(value, 1):
+            if not isinstance(q, dict):
+                raise serializers.ValidationError(f'Question {i} must be an object.')
+            if not str(q.get('text', '')).strip():
+                raise serializers.ValidationError(f'Question {i} needs question text.')
+            options = q.get('options')
+            if not isinstance(options, list) or len(options) < 2 or any(not str(o).strip() for o in options):
+                raise serializers.ValidationError(f'Question {i} needs at least two non-empty options.')
+            try:
+                answer = int(q.get('correct_answer'))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(f'Question {i} needs a correct answer (option number).')
+            if isinstance(q.get('correct_answer'), bool) or not 0 <= answer < len(options):
+                raise serializers.ValidationError(f'Question {i}: correct answer must match one of the options.')
+            qid = str(q.get('id', i))
+            if qid in seen_ids:
+                raise serializers.ValidationError(f'Question {i} has a duplicate id "{qid}".')
+            seen_ids.add(qid)
+            cleaned.append({**q, 'correct_answer': answer})
+        return cleaned
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             can_see_answers = request.user.is_superuser or request.user.role == 'admin' or (request.user.role == 'trainer' and instance.course.trainer_id == request.user.id)
-            if not can_see_answers:
+            # A learner who already submitted may see the correct answers (read-only review).
+            has_attempted = (not can_see_answers) and Attempt.objects.filter(trainee=request.user, assessment=instance).exists()
+            if not can_see_answers and not has_attempted:
                 data['questions'] = [{k:v for k,v in q.items() if k != 'correct_answer'} for q in (instance.questions or [])]
         return data
 class AttemptSerializer(serializers.ModelSerializer):

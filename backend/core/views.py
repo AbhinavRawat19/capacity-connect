@@ -44,6 +44,10 @@ def me(request):
 def become_trainer(request):
     if request.user.is_superuser or request.user.role == 'admin':
         return Response({'detail':'Administrator accounts cannot switch to trainer mode.'},status=400)
+    if request.user.role == 'trainer':
+        # Already a trainer: do not reset approval (that would lock an approved trainer out).
+        msg = 'You are already a trainer.' if request.user.is_approved else 'Your trainer request is still awaiting administrator approval.'
+        return Response({'message':msg,'user':UserSerializer(request.user).data}, status=200)
     request.user.role='trainer'
     request.user.is_approved=False
     request.user.save(update_fields=['role','is_approved'])
@@ -58,6 +62,10 @@ class CourseViewSet(viewsets.ModelViewSet):
         if user.role == 'trainer' and self.action in ['update','partial_update','destroy']:
             return qs.filter(trainer=user)
         if user.role == 'trainee': return qs.filter(is_published=True)
+        if user.role == 'trainer' and not user.is_superuser:
+            # Trainers browse published courses plus their own drafts, never other trainers' drafts.
+            from django.db.models import Q
+            return qs.filter(Q(is_published=True) | Q(trainer=user))
         return qs
     def get_permissions(self):
         if self.action in ['create']: return [IsAuthenticated(), IsApproved(), IsTrainerOrAdmin()]
@@ -182,7 +190,7 @@ def _platform_fee_percent():
 def paypal_create_order(request):
     try:
         course = Course.objects.select_for_update().get(pk=request.data.get('course_id'), is_published=True)
-    except Course.DoesNotExist:
+    except (Course.DoesNotExist, TypeError, ValueError):
         return Response({'detail':'Course not found.'}, status=404)
     if Enrollment.objects.filter(trainee=request.user, course=course).exists():
         return Response({'detail':'You are already enrolled.'}, status=409)
@@ -841,6 +849,9 @@ class AssessmentViewSet(viewsets.ModelViewSet):
         assessment = serializer.save(created_by=user)
         sync_assessment_questions_to_bank(assessment)
     def perform_update(self, serializer):
+        course = serializer.validated_data.get('course')
+        if self.request.user.role == 'trainer' and course is not None and course.trainer_id != self.request.user.id:
+            raise PermissionError('Trainers can only move assessments to their own courses.')
         assessment = serializer.save()
         sync_assessment_questions_to_bank(assessment)
     def create(self, request, *args, **kwargs):
@@ -849,7 +860,8 @@ class AssessmentViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         obj=self.get_object()
         if request.user.role=='trainer' and obj.course.trainer_id != request.user.id: return Response({'detail':'You cannot edit this assessment.'},status=403)
-        return super().update(request,*args,**kwargs)
+        try: return super().update(request,*args,**kwargs)
+        except PermissionError as e: return Response({'detail':str(e)},status=403)
     def destroy(self, request, *args, **kwargs):
         obj=self.get_object()
         if request.user.role=='trainer' and obj.course.trainer_id != request.user.id: return Response({'detail':'You cannot delete this assessment.'},status=403)
@@ -940,16 +952,36 @@ class QuestionSubmissionViewSet(viewsets.ModelViewSet):
         # Students can view the published question bank and their own submissions only.
         return qs.filter(models_q_for_student(user))
 
+    @staticmethod
+    def _trainer_owns(user, submission):
+        """A trainer may change a question only on their own course or one they submitted themselves.
+        (The queryset also exposes other trainers' approved questions for practice, read-only.)"""
+        return submission.submitted_by_id == user.id or bool(submission.course_id and submission.course.trainer_id == user.id)
+
     def update(self, request, *args, **kwargs):
         submission = self.get_object()
-        if request.user.role not in ['trainer', 'admin'] and not request.user.is_superuser:
+        if request.user.role == 'trainer' and not request.user.is_superuser:
+            if not self._trainer_owns(request.user, submission):
+                return Response({'detail':'You can edit only questions on your own courses.'}, status=403)
+        elif request.user.role != 'admin' and not request.user.is_superuser:
             if submission.submitted_by_id != request.user.id or submission.status not in ['pending', 'revision']:
                 return Response({'detail':'You can edit only your own questions while they are pending or need revision.'}, status=403)
         return super().update(request, *args, **kwargs)
 
+    def perform_update(self, serializer):
+        user = self.request.user
+        course = serializer.validated_data.get('course')
+        if user.role == 'trainer' and not user.is_superuser and course is not None and course.trainer_id != user.id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('Choose one of your own courses.')
+        serializer.save()
+
     def destroy(self, request, *args, **kwargs):
         submission = self.get_object()
-        if request.user.role not in ['trainer', 'admin'] and not request.user.is_superuser:
+        if request.user.role == 'trainer' and not request.user.is_superuser:
+            if not self._trainer_owns(request.user, submission):
+                return Response({'detail':'You can delete only questions on your own courses.'}, status=403)
+        elif request.user.role != 'admin' and not request.user.is_superuser:
             if submission.submitted_by_id != request.user.id or submission.status not in ['pending', 'revision']:
                 return Response({'detail':'You can delete only your own questions while they are pending or need revision.'}, status=403)
         return super().destroy(request, *args, **kwargs)
@@ -1150,6 +1182,7 @@ def update_user_role(request,user_id):
     role=request.data.get('role')
     if role not in ['trainee','trainer','admin']: return Response({'detail':'Invalid role.'},status=400)
     if user.is_superuser: return Response({'detail':'Cannot change a superuser role here.'},status=400)
+    if user.pk == request.user.pk and role != user.role: return Response({'detail':'You cannot change your own role.'},status=400)
     user.role=role; user.save(update_fields=['role'])
     return Response(UserSerializer(user).data)
 
@@ -1168,8 +1201,8 @@ class CourseLessonViewSet(viewsets.ModelViewSet):
         if user.role == 'admin' or user.is_superuser: return qs
         # Trainers can also learn: show their own course content plus previews/enrolled courses.
         from django.db.models import Q
-        if user.role == 'trainer': return qs.filter(Q(course__trainer=user) | Q(is_preview=True) | Q(course__enrollments__trainee=user)).distinct()
-        return qs.filter(Q(is_preview=True) | Q(course__enrollments__trainee=user)).distinct()
+        if user.role == 'trainer': return qs.filter(Q(course__trainer=user) | Q(is_preview=True, course__is_published=True) | Q(course__enrollments__trainee=user)).distinct()
+        return qs.filter(Q(is_preview=True, course__is_published=True) | Q(course__enrollments__trainee=user)).distinct()
     def get_permissions(self):
         if self.action in ['create','update','partial_update','destroy']:
             return [IsAuthenticated(), IsApproved(), IsTrainerOrAdmin()]
@@ -1179,6 +1212,12 @@ class CourseLessonViewSet(viewsets.ModelViewSet):
         if self.request.user.role == 'trainer' and course.trainer_id != self.request.user.id:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied('You can only add lectures to your own courses.')
+        serializer.save()
+    def perform_update(self, serializer):
+        course = serializer.validated_data.get('course')
+        if self.request.user.role == 'trainer' and course is not None and course.trainer_id != self.request.user.id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('You can only move lectures to your own courses.')
         serializer.save()
     def update(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -1214,6 +1253,12 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied('You can only create assignments for your own courses.')
         serializer.save(created_by=user)
+    def perform_update(self, serializer):
+        course = serializer.validated_data.get('course')
+        if self.request.user.role == 'trainer' and course is not None and course.trainer_id != self.request.user.id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('You can only move assignments to your own courses.')
+        serializer.save()
     def update(self, request, *args, **kwargs):
         obj=self.get_object()
         if request.user.role=='trainer' and obj.course.trainer_id != request.user.id: return Response({'detail':'You can only edit your own assignments.'},status=403)

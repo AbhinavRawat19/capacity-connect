@@ -714,6 +714,89 @@ class CapacityConnectFullAPITests(TestCase):
         for q in response.data["questions"]:
             self.assertIn("correct_answer", q)
 
+    def test_learner_sees_correct_answers_only_after_submitting(self):
+        self.client.force_authenticate(user=self.learner)
+        self.client.post(f"/api/assessments/{self.assessment.id}/submit/", {
+            "answers": {"q1": 0, "q2": 0},
+        }, format="json")
+        response = self.client.get(f"/api/assessments/{self.assessment.id}/")
+        self.assertEqual(response.status_code, 200)
+        for q in response.data["questions"]:
+            self.assertIn("correct_answer", q)
+
+    def test_create_order_with_non_numeric_course_id_returns_404(self):
+        self.client.force_authenticate(user=self.learner)
+        for bad in ("abc", None, [], {}):
+            response = self.client.post("/api/payments/create-order/", {"course_id": bad}, format="json")
+            self.assertEqual(response.status_code, 404, bad)
+
+    def test_assessment_rejects_malformed_questions(self):
+        self.client.force_authenticate(user=self.trainer)
+        bad_sets = [
+            "not a list",
+            ["not an object"],
+            [{"id": "q1", "text": "", "options": ["A", "B"], "correct_answer": 0}],
+            [{"id": "q1", "text": "Q?", "options": ["A"], "correct_answer": 0}],
+            [{"id": "q1", "text": "Q?", "options": ["A", "B"]}],
+            [{"id": "q1", "text": "Q?", "options": ["A", "B"], "correct_answer": 5}],
+            [{"id": "q1", "text": "Q?", "options": ["A", "B"], "correct_answer": 0},
+             {"id": "q1", "text": "Q2?", "options": ["A", "B"], "correct_answer": 1}],
+        ]
+        for questions in bad_sets:
+            response = self.client.post("/api/assessments/", {
+                "course": self.course.id, "title": "Bad", "questions": questions,
+            }, format="json")
+            self.assertEqual(response.status_code, 400, questions)
+
+    def test_trainer_cannot_move_assessment_to_another_trainers_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch(f"/api/assessments/{self.assessment.id}/", {
+            "course": self.course2.id,
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assessment.refresh_from_db()
+        self.assertEqual(self.assessment.course_id, self.course.id)
+
+    def test_trainer_cannot_move_lesson_to_another_trainers_course(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.patch(f"/api/lessons/{self.regular_lesson.id}/", {
+            "course": self.course2.id,
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_trainer_cannot_edit_or_delete_another_trainers_bank_question(self):
+        question = QuestionSubmission.objects.create(
+            submitted_by=self.trainer2, course=self.course2,
+            question_text="Trainer2 question?", options=["A", "B", "C", "D"],
+            correct_answer=0, status="approved",
+        )
+        self.client.force_authenticate(user=self.trainer)
+        self.assertEqual(self.client.patch(
+            f"/api/question-submissions/{question.id}/", {"explanation": "hijacked"}, format="json",
+        ).status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/question-submissions/{question.id}/").status_code, 403)
+        self.assertTrue(QuestionSubmission.objects.filter(pk=question.id).exists())
+
+    def test_trainer_cannot_see_another_trainers_draft_course(self):
+        draft = Course.objects.create(title="T2 Draft", description="x", trainer=self.trainer2, is_published=False)
+        self.client.force_authenticate(user=self.trainer)
+        self.assertEqual(self.client.get(f"/api/courses/{draft.id}/").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/courses/{self.unpublished_course.id}/").status_code, 200)
+
+    def test_approved_trainer_calling_become_trainer_keeps_access(self):
+        self.client.force_authenticate(user=self.trainer)
+        response = self.client.post("/api/auth/become-trainer/", {}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.trainer.refresh_from_db()
+        self.assertTrue(self.trainer.is_approved)
+
+    def test_admin_cannot_change_own_role(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(f"/api/admin/users/{self.admin.id}/role/", {"role": "trainee"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.admin.refresh_from_db()
+        self.assertEqual(self.admin.role, "admin")
+
     # ── Assignments ─────────────────────────────────────────────────────
 
     def test_trainer_creates_assignment(self):
