@@ -250,7 +250,7 @@ class Command(BaseCommand):
                 chosen = question.get("correct_answer", 0) if correct else (question.get("correct_answer", 0) + 1) % max(1, len(question.get("options", [])))
                 answers[str(question.get("id", index))] = chosen
                 results[str(question.get("id", index))] = correct
-            Attempt.objects.update_or_create(
+            Attempt.objects.get_or_create(
                 trainee=learners[username], assessment=assessment,
                 defaults={"answers": answers,
                           "score": round(correct_count / len(questions) * 100, 2) if questions else 0,
