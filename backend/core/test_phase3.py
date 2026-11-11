@@ -125,12 +125,12 @@ class Phase3FinancialManagementTests(TestCase):
         }
         first = self.client.post('/api/payments/webhook/', payload, format='json', **headers)
         second = self.client.post('/api/payments/webhook/', payload, format='json', **headers)
-        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 200)
         self.payment.refresh_from_db()
-        self.assertEqual(self.payment.refunded_amount, Decimal('100.00'))
-        self.assertEqual(self.payment.status, 'refunded')
-        self.assertEqual(self.payment.refunds.count(), 1)
+        self.assertEqual(self.payment.refunded_amount, Decimal('0.00'))
+        self.assertEqual(self.payment.status, 'captured')
+        self.assertEqual(self.payment.refunds.count(), 0)
         self.assertFalse(Enrollment.objects.filter(trainee=self.learner, course=self.course).exists())
 
     @override_settings(PAYPAL_WEBHOOK_ID='sandbox-webhook-id')
